@@ -1,0 +1,19 @@
+# Python
+backend/.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Env
+.env
+
+# Data
+eval/offline_recsys/data/*
+!eval/offline_recsys/data/.gitkeep
+
+# OS
+.DS_Store
