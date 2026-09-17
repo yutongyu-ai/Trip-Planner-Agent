@@ -1,10 +1,12 @@
 import { useLanguage } from '../i18n'
 import type { Lang } from '../i18n'
 import type { ItineraryDay, TripPlanResponse } from '../types'
+import { ChatEditor } from './ChatEditor'
 
 interface TripPlanViewProps {
   plan: TripPlanResponse
   dayStartTime: string // HH:MM, the day-start the itinerary's offsets are relative to
+  onItineraryUpdate: (itinerary: ItineraryDay[]) => void
   onReset: () => void
 }
 
@@ -112,17 +114,11 @@ function DayCard({ day, index, dayStartMinutes }: { day: ItineraryDay; index: nu
           })}
         </ol>
       )}
-      {(day.dropped_stops?.length ?? 0) > 0 && (
-        <p className="day-dropped">
-          {t('droppedPrefix')}
-          {day.dropped_stops.join(lang === 'zh' ? '、' : ', ')}
-        </p>
-      )}
     </li>
   )
 }
 
-export function TripPlanView({ plan, dayStartTime, onReset }: TripPlanViewProps) {
+export function TripPlanView({ plan, dayStartTime, onItineraryUpdate, onReset }: TripPlanViewProps) {
   const { lang, t } = useLanguage()
   const dayStartMinutes = parseDayStartMinutes(dayStartTime)
 
@@ -153,6 +149,7 @@ export function TripPlanView({ plan, dayStartTime, onReset }: TripPlanViewProps)
           <DayCard key={day.date} day={day} index={index} dayStartMinutes={dayStartMinutes} />
         ))}
       </ol>
+      <ChatEditor sessionId={plan.session_id} onItineraryUpdate={onItineraryUpdate} />
       <button type="button" className="secondary-button" onClick={onReset}>
         {t('planAnother')}
       </button>

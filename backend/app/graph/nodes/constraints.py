@@ -21,10 +21,12 @@ from app.graph.nodes._shared import (
     MAX_PRICE_LEVEL,
     PRICE_LEVEL_RANK,
     STOPS_PER_DAY_RANGE,
+    affordable_candidate_count,
     attraction_lookup,
     estimate_travel_minutes,
     is_open_during,
     is_open_on,
+    is_pool_exhausted,
     minutes_to_clock,
     realistic_transit_minutes,
     time_to_minutes,
@@ -78,26 +80,42 @@ def check_constraints_node(state: AgentState) -> dict:
 
     # A day can't be asked to add stops that don't exist: if every ranked
     # candidate is already scheduled somewhere, an under-full day is the
-    # candidate pool's fault, not the LLM's, and re-planning won't help.
-    used_anywhere = {stop["place_id"] for d in itinerary for stop in real_stops(d)}
-    pool_exhausted = bool(attractions_by_id) and used_anywhere >= set(attractions_by_id)
+    # candidate pool's fault, not the LLM's, and re-planning won't help. This
+    # is the trip-wide version (used for the state flag human_review_node and
+    # finalize.py read); the loop below computes its own per-day version --
+    # see used_before_this_day -- because this one alone would wrongly
+    # excuse an early under-filled day just because a *later* day went on to
+    # exhaust the pool, when the early day still had plenty of unclaimed
+    # candidates at the point it was actually planned.
+    pool_exhausted = is_pool_exhausted(attractions_by_id, itinerary)
 
     # Likewise for budget: if there aren't `lo` candidates within the budget
     # cap, a day of `lo`+ stops *has* to include pricier ones -- that's the
-    # city, not the LLM. finalize.py turns this into an advisory note.
-    affordable = sum(
-        1
-        for a in attractions_by_id.values()
-        if a.price_level is None or PRICE_LEVEL_RANK.get(a.price_level, 0) <= max_price
-    )
+    # city, not the LLM. Both flags are returned in state (not just used
+    # locally) so human_review_node can offer the traveller a real choice
+    # instead of finalize.py silently downgrading this to an advisory note.
+    affordable = affordable_candidate_count(attractions_by_id, max_price)
     budget_unavoidable = bool(attractions_by_id) and affordable < lo
 
     first_seen_date: dict[str, str] = {}  # place_id -> date_str of its first-scheduled day
+    # Candidates already claimed by an *earlier* day, as of the day currently
+    # being checked -- not the whole itinerary. Whether this day's own
+    # shortfall is the pool's fault depends on what was still unclaimed when
+    # it was planned, not on what later days went on to use.
+    used_before_this_day: set[str] = set()
     for offset, day in enumerate(itinerary):
         date_str = str(day["date"])
         stops = real_stops(day)
         stop_count = len(stops)
-        if stop_count > hi or (stop_count < lo and not pool_exhausted):
+        # What this day actually had to draw from: everything ranked, minus
+        # whatever an earlier day already claimed (a set difference, not a
+        # raw count subtraction, so a stray place_id used_before_this_day
+        # that isn't itself a ranked candidate can't push this negative).
+        available_to_this_day = len(set(attractions_by_id) - used_before_this_day)
+        # Below `lo` available at all: no re-plan can reach the minimum, no
+        # matter how many of those it actually picked -- excuse stop_count.
+        day_pool_exhausted = available_to_this_day < lo
+        if stop_count > hi or (stop_count < lo and not day_pool_exhausted):
             add(offset, violation_stop_count(lang, date_str, stop_count, trip_setup["daily_pace"], lo, hi))
 
         price_levels = [
@@ -183,10 +201,28 @@ def check_constraints_node(state: AgentState) -> dict:
                         f"{trip_setup['day_end_time']:%H:%M}",
                     ),
                 )
-            elif stop_count < hi and not pool_exhausted and last_stop_end < window_min * _UNDERFILL_RATIO:
+            # Different question from day_pool_exhausted above: not "could
+            # this day have reached `lo`", but "did it leave something on
+            # the table" -- a day that already took every candidate it had
+            # access to (available_to_this_day == stop_count) has nothing
+            # left to add regardless of how that compares to `lo`, so ending
+            # early isn't a planning mistake even if picking more would
+            # still have kept it under `hi`.
+            elif (
+                stop_count < hi
+                and available_to_this_day > stop_count
+                and last_stop_end < window_min * _UNDERFILL_RATIO
+            ):
                 add(offset, violation_day_underfilled(lang, date_str, last_stop_end, window_min, hi))
 
-    return {"constraint_violations": violations, "violations_by_day": violations_by_day}
+        used_before_this_day.update(s["place_id"] for s in stops)
+
+    return {
+        "constraint_violations": violations,
+        "violations_by_day": violations_by_day,
+        "budget_unavoidable": budget_unavoidable,
+        "pool_exhausted": pool_exhausted,
+    }
 
 
 def should_refine(state: AgentState) -> Literal["itinerary", "finalize"]:

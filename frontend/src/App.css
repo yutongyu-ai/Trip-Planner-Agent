@@ -136,6 +136,10 @@
     color: var(--text);
   }
 
+  small.field-error {
+    color: #d0374c;
+  }
+
   input,
   select {
     font: inherit;
@@ -160,6 +164,10 @@
     &:disabled {
       opacity: 0.6;
     }
+
+    &.field-invalid {
+      border-color: #d0374c;
+    }
   }
 }
 
@@ -170,6 +178,35 @@
   .field {
     flex: 1 1 0;
     min-width: 0;
+  }
+}
+
+.field-checkbox {
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+
+  input[type='checkbox'] {
+    width: 16px;
+    height: 16px;
+    flex: 0 0 auto;
+    padding: 0;
+    border-radius: 4px;
+    accent-color: var(--accent);
+  }
+
+  span {
+    font-weight: 400;
+  }
+}
+
+.interest-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+
+  .interest-option {
+    flex: 0 0 auto;
   }
 }
 
@@ -468,13 +505,6 @@
   padding-left: 88px;
 }
 
-.day-dropped {
-  margin: 10px 0 0;
-  font-size: 13px;
-  color: var(--text);
-  opacity: 0.85;
-}
-
 .stop-meal {
   display: flex;
   flex-direction: column;
@@ -495,4 +525,90 @@
   font-size: 12px;
   color: var(--text);
   opacity: 0.6;
+}
+
+.chat-editor {
+  margin-top: 24px;
+  padding: 20px 24px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg);
+  box-shadow: var(--shadow);
+  box-sizing: border-box;
+
+  h3 {
+    margin: 0 0 4px;
+    font-size: 16px;
+  }
+}
+
+.chat-hint {
+  margin: 0 0 14px;
+  font-size: 13px;
+  color: var(--text);
+  opacity: 0.8;
+}
+
+.chat-messages {
+  list-style: none;
+  margin: 0 0 14px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.chat-message {
+  padding: 8px 12px;
+  border-radius: 8px;
+  font-size: 14px;
+  line-height: 1.5;
+  max-width: 90%;
+  white-space: pre-wrap;
+}
+
+.chat-message-user {
+  align-self: flex-end;
+  background: var(--accent);
+  color: white;
+}
+
+.chat-message-assistant {
+  align-self: flex-start;
+  background: var(--accent-bg);
+  color: var(--text-h);
+}
+
+.chat-form {
+  display: flex;
+  gap: 10px;
+
+  input {
+    flex: 1 1 auto;
+    min-width: 0;
+    font: inherit;
+    font-size: 15px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text-h);
+    box-sizing: border-box;
+
+    &:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 1px;
+    }
+
+    &:disabled {
+      opacity: 0.6;
+    }
+  }
+
+  .primary-button {
+    padding: 10px 18px;
+    font-size: 15px;
+  }
 }

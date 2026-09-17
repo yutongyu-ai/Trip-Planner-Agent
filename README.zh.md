@@ -30,6 +30,12 @@ React (Vite + TS)
 2. **重试 + 优雅降级** —— 候选景点太少时自动放大搜索半径重试（见 `app/tools/places_client.py` 的 `_RADIUS_LADDER_M`）。
 3. **有界约束检查循环** —— 行程合成后检查是否违反用户设定的每日节奏/预算；若违反则回到规划节点重排，最多 2 轮。
 
+以上三点都是**写死的控制流**——分支由规则决定，模型从不参与。**`POST /trip-plan/{session_id}/chat`（`app/agent/`）是本项目里唯一一处真正由模型自己决定调用哪个工具、何时收手的地方**：一句自由文本的追加需求（"这个博物馆太贵了，换个便宜点的"、"查一下周三的天气，如果不好就把露天景点换成室内的"）由 `langgraph.prebuilt.create_react_agent` 处理，绑定六个工具（`list_itinerary`、`find_alternative`、`swap_stop`、`remove_stop`、`add_stop`、`check_weather`——见 `app/agent/tools.py`），循环"调用工具 → 观察结果 → 决定下一步"直到满足请求为止。每个工具都只是对生成阶段同一个确定性排程器（`schedule_day_with_lunch`）的薄封装、带校验——模型依然从不自己指定时间或顺序，只负责挑*哪个* place_id，和 `itinerary_node` 的分工原则一致。这个 agent 单独的评估（轨迹长度、非法工具调用率、任务成功率）见 [`eval/agent_chat/`](eval/agent_chat/README.md)，和下面生成流水线自己的 eval 是两回事。已知的范围限制：一次编辑只需要满足排程器自身的可行性（营业时间、通勤时间、午餐），**不会**像生成阶段那样重新对照用户设定的节奏/预算范围检查——所以一次对话编辑有可能让某一天变得比原方案更单薄，而不会告知用户。
+
+同样的三个工具客户端还包了一层 **MCP server**（`app/mcp_server.py`）——对现有 provider `Protocol` 层（`app/tools/providers.py`，见 [ADR-001](docs/adr-001-provider-abstraction.md)）的一层薄声明式封装，让 `search_attractions` / `get_weather_forecast` / `get_distance_matrix` 可以被任意 MCP client（Claude Desktop、另一个 agent）调用，而不只是本项目自己的 LangGraph 节点。`scripts/mcp_client_demo.py` 是一个可运行的演示：通过 stdio 连接，对真实 Google Places API 端到端调用 `search_attractions`。
+
+主生成图也加了一个真正的**人工介入（human-in-the-loop）暂停点**，不只是对话 agent 才有自主性：当 `check_constraints_node` 发现一个 LLM 和有界 refine 循环都自己解决不了的违规——目的地里没有足够便宜的候选点，或者候选池已经用光（`AgentState` 上的 `budget_unavoidable` / `pool_exhausted`）——`human_review_node`（`app/graph/nodes/human_review.py`）会用 LangGraph 的 `interrupt()` 把这次运行暂停下来，而不是悄悄降级成一条提示文字。这种情况下 `POST /trip-plan` 会返回 `{"status": "needs_input", "reason", "violations", "options"}`；`POST /trip-plan/{session_id}/resume` 用来回应它（"accept" 照原样接受，或 "relax_budget" 放宽一档预算再给 refine 循环一次机会）。这需要一个 checkpointer（`MemorySaver`，接在 `app/main.py` 里）才能让暂停状态跨越可能是另一次 HTTP 请求的间隔存活下来——和对话 agent 自己用来存会话记忆的是同一个 LangGraph 原语，用在了不同的问题上。
+
 **LLM 到哪里为止，Python 从哪里开始。** 行程 LLM 只负责*挑选*每天去哪些景点、每个大概待多久，**不**决定到达时间和游玩顺序——那是算术（按营业时间对齐、给通勤留时间、排序以减少在途时间），LLM 做不可靠、重排也纠正不过来。一个确定性排程器（`app/graph/scheduling.py`，一个带时间窗的小 TSP 搜索）来做这件事，一天装不下时丢掉排名最低的景点，并在当天中段留一个午餐时段（固定时长——不推荐餐厅，那是另一个问题）。景点间通勤时间从 OSRM 距离矩阵起步（未覆盖的点对退回直线估算），再修正成现实的门到门时间——OSRM 公共服务器没有路况模型，而游客穿城靠的是公共交通、不是点到点驾车。LLM 会拿到按节奏定的**时间预算**（适中的一天填 ≈ 5.5–7 小时等）和各类别的现实游玩时长，所以行程不会交回半空的一天。
 
 推荐模块是**基于 embedding 的检索式排序**，不是训练出来的模型：候选景点描述和用户偏好文本各自编码（多语 sentence-transformer，使中文偏好文本和中文地点描述落在同一向量空间），按余弦相似度打分，再与归一化评分混合。离线评估在 `eval/offline_recsys/`，用 Yelp Open Dataset 的子集计算 NDCG@k / Precision@k，对比「按评分排序」基线。
@@ -49,6 +55,9 @@ Agent 端到端评估在 `eval/agent_e2e/`（[详情 + 完整结果](eval/agent_
 - [x] LangGraph agent 核心（`backend/app/graph/`，`POST /trip-plan`）
 - [x] Agent 端到端评估（见 `eval/agent_e2e/`，合成场景 + 真实 LLM 调用，重排循环 vs. 单次生成对比）
 - [x] 前端页面（Trip Setup / Trip Plan，`frontend/src/`，通过 `POST /trip-plan` 与后端通信）
+- [x] 对话式行程编辑 agent（`backend/app/agent/`，`POST /trip-plan/{session_id}/chat`，ReAct + function calling；见 `eval/agent_chat/`）
+- [x] 暴露工具客户端的 MCP server（`backend/app/mcp_server.py`，`scripts/mcp_client_demo.py`）
+- [x] 主图上的人工介入暂停点 + checkpointing（`backend/app/graph/nodes/human_review.py`，`POST /trip-plan/{session_id}/resume`）
 
 ## 本地开发
 
@@ -74,7 +83,7 @@ npm install
 npm run dev
 ```
 
-### Docker（尚未端到端验证过）
+### Docker
 
 ```bash
 docker compose up --build

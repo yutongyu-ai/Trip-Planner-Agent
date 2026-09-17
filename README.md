@@ -29,6 +29,12 @@ React (Vite + TS)
 2. **Retry with graceful degradation** — automatically widens the search radius and retries when too few attraction candidates come back (see `_RADIUS_LADDER_M` in `app/tools/places_client.py`).
 3. **A bounded constraint-checking loop** — after the itinerary is synthesized, checks whether it violates the user's stated daily pace/budget; if it does, loops back and re-plans, up to 2 iterations.
 
+All three of the above are *fixed* control flow — a rule decides the branch, never the model. **`POST /trip-plan/{session_id}/chat` (`app/agent/`) is the one place in this project where the model itself decides which tool to call and when to stop**: a free-text follow-up ("this museum's too expensive, find something cheaper", "check Wednesday's weather and swap the outdoor stop if it's bad") is handled by a `langgraph.prebuilt.create_react_agent` bound to six tools (`list_itinerary`, `find_alternative`, `swap_stop`, `remove_stop`, `add_stop`, `check_weather` — see `app/agent/tools.py`), looping tool-call → observation → next decision until the request is satisfied. Every tool is a thin, validated wrapper around the same deterministic scheduler the generation pipeline uses (`schedule_day_with_lunch`) — the model still never assigns a time or visit order itself, it only ever picks *which* place_id, the same division of labour as `itinerary_node`. See [`eval/agent_chat/`](eval/agent_chat/README.md) for evaluation of this agent specifically (trajectory length, invalid-tool-call rate, task success) as opposed to the generation pipeline's own eval below. Known scope limit: an edit only has to satisfy the scheduler's own feasibility (opening hours, travel time, lunch) — it is not re-checked against the traveller's stated pace/budget range the way generation is, so a chat edit can leave a day thinner than the original plan without saying so.
+
+The same three tool clients are also exposed as an **MCP server** (`app/mcp_server.py`) — a thin declarative wrapper around the existing provider `Protocol` layer (`app/tools/providers.py`, see [ADR-001](docs/adr-001-provider-abstraction.md)), so `search_attractions` / `get_weather_forecast` / `get_distance_matrix` are callable by any MCP client (Claude Desktop, another agent), not just this project's own LangGraph nodes. `scripts/mcp_client_demo.py` is a runnable demo: connects over stdio and calls `search_attractions` end-to-end against the real Google Places API.
+
+The main generation graph also gets a real **human-in-the-loop pause**, not just the chat agent's autonomy: when `check_constraints_node` hits a violation neither the LLM nor the bounded refine loop can fix by itself — not enough affordable candidates in the destination, or the candidate pool already fully used (`budget_unavoidable` / `pool_exhausted` on `AgentState`) — `human_review_node` (`app/graph/nodes/human_review.py`) pauses the run via LangGraph's `interrupt()` instead of silently downgrading it to an advisory note. `POST /trip-plan` returns `{"status": "needs_input", "reason", "violations", "options"}` in that case; `POST /trip-plan/{session_id}/resume` answers it ("accept" the plan as-is, or "relax_budget" to loosen one tier and give the refine loop another attempt). This needs a checkpointer (`MemorySaver`, wired in `app/main.py`) so the pause survives across what may be a separate HTTP request — the same LangGraph primitive the chat agent uses for its own conversation memory, applied to a different problem.
+
 **Where the LLM stops and Python starts.** The itinerary LLM only *picks* which attractions go on a day and roughly how long to spend at each. It does **not** assign arrival times or visit order — that's arithmetic (line each visit up with the place's opening hours, leave room for travel between stops, order to minimise transit), which an LLM does unreliably and won't fix on a refine pass. A deterministic scheduler (`app/graph/scheduling.py`, a small travelling-salesman-with-time-windows search) does that, drops the lowest-ranked stop when a day can't fit them all, and leaves a lunch break in the middle of the day (a fixed-length window — no restaurant recommended, that's a separate problem). Travel time between stops starts from an OSRM distance matrix (straight-line fallback for uncovered pairs) and is adjusted to a realistic door-to-door figure — OSRM's public server has no traffic model, and a tourist crossing a city takes transit, not a point-to-point drive. The LLM is given a per-pace *time budget* (fill ~5.5–7 hours of a moderate day, etc.) and realistic per-category visit durations, so days don't come back half-empty.
 
 The recommendation module is **embedding-based retrieval ranking**, not a trained model: candidate attraction descriptions and the user's stated preferences are each embedded (a multilingual sentence-transformer, so a Chinese preference string and Chinese place descriptions land in the same space), scored by cosine similarity, and blended with a normalized rating. Offline evaluation lives under `eval/offline_recsys/`, using a subset of the Yelp Open Dataset to compute NDCG@k / Precision@k against a "sort by rating" baseline.
@@ -48,6 +54,9 @@ Agent end-to-end evaluation lives under `eval/agent_e2e/` ([details + full resul
 - [x] LangGraph agent core (`backend/app/graph/`, `POST /trip-plan`)
 - [x] Agent end-to-end evaluation (see `eval/agent_e2e/`, synthetic scenarios + real LLM calls, refine loop vs. single-shot comparison)
 - [x] Frontend pages (Trip Setup / Trip Plan, `frontend/src/`, talks to the backend via `POST /trip-plan`)
+- [x] Conversational itinerary-edit agent (`backend/app/agent/`, `POST /trip-plan/{session_id}/chat`, ReAct + function calling; see `eval/agent_chat/`)
+- [x] MCP server exposing the tool clients (`backend/app/mcp_server.py`, `scripts/mcp_client_demo.py`)
+- [x] Human-in-the-loop pause + checkpointing on the main graph (`backend/app/graph/nodes/human_review.py`, `POST /trip-plan/{session_id}/resume`)
 
 ## Local Development
 
@@ -73,7 +82,7 @@ npm install
 npm run dev
 ```
 
-### Docker (not yet verified end-to-end)
+### Docker
 
 ```bash
 docker compose up --build

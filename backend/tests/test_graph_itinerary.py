@@ -440,6 +440,74 @@ def test_itinerary_node_uses_the_osrm_matrix_for_travel_time():
     assert stops[1]["travel_from_prev_min"] == 72
 
 
+def test_itinerary_node_hard_filters_to_indoor_when_traveller_opted_in_on_bad_weather():
+    # relaxed pace needs stops_lo=2, so 2 indoor candidates is enough for the
+    # hard filter to actually commit instead of falling back to the full pool.
+    ranked = [_ranked("indoor1", ["museum"]), _ranked("indoor2", ["art_gallery"]), _ranked("outdoor", ["park"])]
+    llm = _FakeLLM(
+        [_LLMDayPlan(stops=[_LLMStop(place_id="indoor1", dwell_minutes=60), _LLMStop(place_id="indoor2", dwell_minutes=60)])]
+    )
+    forecast = [
+        DailyForecast(date=START, avg_temp_c=12.0, condition="Rain", description="light rain", is_bad_weather=True)
+    ]
+    trip_setup = _trip_setup(1)
+    trip_setup["daily_pace"] = "relaxed"
+    trip_setup["avoid_outdoor_in_bad_weather"] = True
+
+    itinerary_node(
+        {"trip_setup": trip_setup, "ranked_attractions": ranked, "weather_forecast": forecast}, llm=llm
+    )
+
+    prompt = llm.structured.prompts[0]
+    assert "place_id=indoor1" in prompt
+    assert "place_id=indoor2" in prompt
+    assert "place_id=outdoor" not in prompt
+    assert "skip outdoor plans on bad-weather days" in prompt
+
+
+def test_itinerary_node_does_not_filter_outdoor_when_traveller_did_not_opt_in():
+    ranked = [_ranked("indoor", ["museum"]), _ranked("outdoor", ["park"])]
+    llm = _FakeLLM([_LLMDayPlan(stops=[_LLMStop(place_id="outdoor", dwell_minutes=60)])])
+    forecast = [
+        DailyForecast(date=START, avg_temp_c=12.0, condition="Rain", description="light rain", is_bad_weather=True)
+    ]
+
+    itinerary_node(
+        {"trip_setup": _trip_setup(1), "ranked_attractions": ranked, "weather_forecast": forecast}, llm=llm
+    )
+
+    prompt = llm.structured.prompts[0]
+    assert "place_id=indoor" in prompt
+    assert "place_id=outdoor" in prompt
+    assert "bad weather, prefer indoor stops" in prompt
+
+
+def test_itinerary_node_falls_back_to_full_pool_when_not_enough_indoor_candidates():
+    # Opted in, but every candidate is outdoor -- filtering would leave zero
+    # stops to plan around, so it must fall back to the full pool instead of
+    # handing back an empty day.
+    ranked = [_ranked("outdoor1", ["park"]), _ranked("outdoor2", ["park"])]
+    llm = _FakeLLM(
+        [_LLMDayPlan(stops=[_LLMStop(place_id="outdoor1", dwell_minutes=60)])]
+    )
+    forecast = [
+        DailyForecast(date=START, avg_temp_c=12.0, condition="Rain", description="light rain", is_bad_weather=True)
+    ]
+    trip_setup = _trip_setup(1)
+    trip_setup["avoid_outdoor_in_bad_weather"] = True
+    trip_setup["daily_pace"] = "packed"  # stops_lo=4, higher than the 2 outdoor-only candidates available
+
+    result = itinerary_node(
+        {"trip_setup": trip_setup, "ranked_attractions": ranked, "weather_forecast": forecast}, llm=llm
+    )
+
+    prompt = llm.structured.prompts[0]
+    assert "place_id=outdoor1" in prompt
+    assert "place_id=outdoor2" in prompt
+    assert "bad weather, prefer indoor stops" in prompt
+    assert result["itinerary"][0]["stops"]  # still got a real day back, not an empty one
+
+
 def test_itinerary_node_drops_a_pick_that_cannot_fit_the_day():
     # Four 150-minute stops don't fit a 540-minute day (600 min needed); the
     # lowest-ranked is dropped and reported.

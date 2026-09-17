@@ -132,6 +132,51 @@ def test_does_not_flag_a_thin_day_when_the_candidate_pool_is_exhausted():
     assert not any("stops" in v for v in result["constraint_violations"])
 
 
+def test_flags_an_early_thin_day_even_though_a_later_day_exhausts_the_pool():
+    # Day 0 only gets 1 of 6 known candidates -- a real planning shortfall,
+    # since none of the other 5 had been claimed yet when day 0 was
+    # generated. This must still be flagged even though day 1 goes on to use
+    # up the rest of the pool -- the old check used one whole-itinerary
+    # "is everything used somewhere" flag, which wrongly excused day 0 too
+    # once day 1 made that flag true.
+    ranked = [_ranked(f"p{i}", None) for i in range(6)]
+    state = {
+        "trip_setup": {
+            "daily_pace": "relaxed",  # min 2 stops/day
+            "budget_level": "luxury",
+            "day_start_time": dt.time(9, 0),
+            "day_end_time": dt.time(18, 0),
+        },
+        "ranked_attractions": ranked,
+        "itinerary": [
+            {
+                "date": DAY,
+                "stops": [
+                    {"place_id": "p0", "attraction_name": "p0", "arrival_offset_min": 0, "dwell_minutes": 50},
+                ],
+                "weather_note": None,
+            },
+            {
+                "date": DAY + dt.timedelta(days=1),
+                "stops": [
+                    {
+                        "place_id": f"p{i}",
+                        "attraction_name": f"p{i}",
+                        "arrival_offset_min": (i - 1) * 90,
+                        "dwell_minutes": 50,
+                    }
+                    for i in range(1, 6)
+                ],
+                "weather_note": None,
+            },
+        ],
+    }
+
+    result = check_constraints_node(state)
+
+    assert any("stops" in v for v in result["violations_by_day"].get(0, []))
+
+
 def test_still_flags_too_many_stops_even_when_pool_is_exhausted():
     ranked = [_ranked(f"p{i}", None) for i in range(5)]
     state = _state("relaxed", "luxury", [f"p{i}" for i in range(5)], ranked)

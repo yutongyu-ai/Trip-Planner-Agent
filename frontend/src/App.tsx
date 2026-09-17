@@ -4,11 +4,11 @@ import { LanguageToggle } from './components/LanguageToggle'
 import { TripPlanView } from './components/TripPlanView'
 import { TripSetupForm } from './components/TripSetupForm'
 import { useLanguage } from './i18n'
-import type { TripPlanResponse, TripSetupRequest } from './types'
+import type { ItineraryDay, TripPlanResponse, TripSetupRequest } from './types'
 import './App.css'
 
 type ViewState =
-  | { status: 'setup' }
+  | { status: 'setup'; initialValues?: TripSetupRequest; destinationError?: string }
   | { status: 'loading' }
   | { status: 'error'; message: string }
   | { status: 'plan'; plan: TripPlanResponse; dayStartTime: string }
@@ -21,6 +21,13 @@ function App() {
     setState({ status: 'loading' })
     try {
       const plan = await fetchTripPlan(request, lang)
+      if (plan.error_code === 'destination_not_found') {
+        // A total failure tied to one specific field -- bounce back to the
+        // form (repopulated via initialValues) with the error shown inline
+        // under that field, rather than landing on an empty results page.
+        setState({ status: 'setup', initialValues: request, destinationError: plan.errors[0] })
+        return
+      }
       setState({ status: 'plan', plan, dayStartTime: request.day_start_time })
     } catch (error) {
       const message = error instanceof TripPlanError ? error.message : t('genericError')
@@ -32,6 +39,10 @@ function App() {
     setState({ status: 'setup' })
   }
 
+  function handleItineraryUpdate(itinerary: ItineraryDay[]) {
+    setState((prev) => (prev.status === 'plan' ? { ...prev, plan: { ...prev.plan, itinerary } } : prev))
+  }
+
   return (
     <main className="app-shell">
       <header className="app-header">
@@ -41,7 +52,14 @@ function App() {
         <p>{t('subtitle')}</p>
       </header>
 
-      {state.status === 'setup' && <TripSetupForm onSubmit={handleSubmit} submitting={false} />}
+      {state.status === 'setup' && (
+        <TripSetupForm
+          onSubmit={handleSubmit}
+          submitting={false}
+          initialValues={state.initialValues}
+          destinationError={state.destinationError}
+        />
+      )}
 
       {state.status === 'loading' && (
         <div className="status-panel">
@@ -63,7 +81,12 @@ function App() {
       )}
 
       {state.status === 'plan' && (
-        <TripPlanView plan={state.plan} dayStartTime={state.dayStartTime} onReset={handleReset} />
+        <TripPlanView
+          plan={state.plan}
+          dayStartTime={state.dayStartTime}
+          onItineraryUpdate={handleItineraryUpdate}
+          onReset={handleReset}
+        />
       )}
     </main>
   )

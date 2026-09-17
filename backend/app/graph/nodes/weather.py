@@ -12,6 +12,7 @@ import datetime as dt
 import logging
 from typing import Literal
 
+from app.graph.nodes._shared import ranked_centroid
 from app.graph.state import AgentState
 from app.i18n import openweather_lang
 from app.tools.providers import get_weather_provider
@@ -28,14 +29,12 @@ def should_check_weather(state: AgentState) -> Literal["weather", "route"]:
 
 
 def weather_node(state: AgentState) -> dict:
-    ranked = state.get("ranked_attractions", [])
-    if not ranked:
+    centroid = ranked_centroid(state.get("ranked_attractions", []))
+    if centroid is None:
         # No coordinates to anchor a forecast on (attractions lookup came up
         # empty) -- nothing useful to call the weather API with.
         return {"weather_forecast": []}
-
-    lat = sum(r.attraction.lat for r in ranked) / len(ranked)
-    lng = sum(r.attraction.lng for r in ranked) / len(ranked)
+    lat, lng = centroid
 
     client = get_weather_provider(state.get("destination_country"))
 

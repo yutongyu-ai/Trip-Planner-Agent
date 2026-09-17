@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import math
 
+from app.graph.state import TripSetup
 from app.recsys.rank import RankedAttraction
 from app.tools.places_client import Attraction
 
@@ -49,23 +50,20 @@ _CATEGORY_DWELL = {
     "aquarium": (60, 90, 150),
     "zoo": (120, 165, 240),
     "amusement_park": (150, 300, 480),
-    "theme_park": (150, 300, 480),
     "national_park": (90, 180, 360),
     "park": (30, 60, 150),
     "shopping_mall": (40, 90, 180),
     "tourist_attraction": (20, 45, 150),
     "landmark": (10, 25, 60),
-    "church": (15, 30, 75),
-    "hindu_temple": (15, 30, 75),
-    "mosque": (15, 30, 75),
-    "synagogue": (15, 30, 75),
+    "castle": (45, 120, 240),
+    "place_of_worship": (15, 30, 75),
     "restaurant": (45, 75, 120),
     "cafe": (20, 40, 75),
     "bar": (30, 60, 120),
     "night_club": (60, 120, 240),
     "movie_theater": (90, 130, 180),
-    "casino": (45, 120, 300),
-    "book_store": (15, 30, 90),
+    "performing_arts_theater": (90, 150, 240),
+    "concert_hall": (90, 150, 240),
     "library": (30, 50, 120),
     "stadium": (75, 120, 210),
 }
@@ -88,6 +86,26 @@ PACE_ACTIVITY_HOURS = {
     "moderate": (5.5, 7.0),
     "packed": (7.0, 8.5),
 }
+
+# How many ranked candidates attractions_node keeps. Scaled to the trip
+# itself -- num_days * that pace's upper stop count -- plus a fixed margin so
+# the chat agent's find_alternative/add_stop tools and cross-day duplicate
+# avoidance still have unused places to offer once generation is done; a
+# target sized exactly to what the itinerary will consume leaves nothing
+# spare for either. Capped at what places_client.py's paginated search can
+# realistically supply (see its _MAX_PAGES_PER_SEARCH) -- a trip longer or
+# more packed than the cap covers is expected to legitimately exhaust the
+# pool (see is_pool_exhausted below) rather than have this grow unbounded to
+# chase it.
+CANDIDATE_POOL_MARGIN = 6
+CANDIDATE_POOL_CAP = 40
+
+
+def candidate_pool_target(trip_setup: TripSetup) -> int:
+    num_days = (trip_setup["end_date"] - trip_setup["start_date"]).days + 1
+    _, hi = STOPS_PER_DAY_RANGE[trip_setup["daily_pace"]]
+    return min(CANDIDATE_POOL_CAP, num_days * hi + CANDIDATE_POOL_MARGIN)
+
 
 # Minutes reserved for lunch, by pace -- a relaxed traveller sits down for a
 # proper meal, a packed one grabs something quick and keeps moving. Consumed
@@ -118,14 +136,62 @@ _INDOOR_CATEGORY_KEYWORDS = {
     "planetarium",
     "library",
     "shopping_mall",
-    "movie_theater",
-    "casino",
-    "book_store",
+    "performing_arts_theater",
+    "concert_hall",
+    "place_of_worship",
+    "castle",
 }
 
 
 def attraction_lookup(ranked: list[RankedAttraction]) -> dict[str, Attraction]:
     return {r.attraction.place_id: r.attraction for r in ranked}
+
+
+def affordable_candidate_count(attractions_by_id: dict[str, Attraction], max_price: int) -> int:
+    """How many known candidates cost at most `max_price` (a PRICE_LEVEL_RANK
+    ordinal) or have no price data at all. Shared by check_constraints_node
+    (suppresses the per-day budget violation when this is already too low
+    to hit the day's stop-count minimum) and finalize_node/human_review_node
+    (decide whether that shortfall is worth surfacing/asking about)."""
+    return sum(
+        1
+        for a in attractions_by_id.values()
+        if a.price_level is None or PRICE_LEVEL_RANK.get(a.price_level, 0) <= max_price
+    )
+
+
+def is_pool_exhausted(attractions_by_id: dict[str, Attraction], itinerary: list) -> bool:
+    """True once every known candidate is already scheduled somewhere in the
+    itinerary, OR there were no candidates at all to begin with (the empty
+    set is trivially "fully used") -- either way, an under-full day at that
+    point is the candidate pool's fault, not a planning mistake, and
+    re-planning can't add stops that don't exist. That last case matters in
+    practice: a destination Places couldn't resolve at all (see
+    attractions_node's "destination_not_found") leaves attractions_by_id
+    empty, and without this, check_constraints_node would flag every day as
+    under-filled and the refine loop would burn its full
+    MAX_REFINE_ITERATIONS re-planning attempts against a candidate pool that
+    was never going to grow."""
+    used = {
+        stop["place_id"]
+        for day in itinerary
+        for stop in day["stops"]
+        if stop.get("kind", "attraction") == "attraction"
+    }
+    return used >= set(attractions_by_id)
+
+
+def ranked_centroid(ranked: list[RankedAttraction]) -> tuple[float, float] | None:
+    """Mean (lat, lng) of `ranked`'s attractions -- a rough single anchor
+    point for a trip-wide weather lookup. None if there's nothing to anchor
+    on. Shared by weather_node (whole-trip forecast) and the chat agent's
+    check_weather tool (single-date lookup)."""
+    if not ranked:
+        return None
+    return (
+        sum(r.attraction.lat for r in ranked) / len(ranked),
+        sum(r.attraction.lng for r in ranked) / len(ranked),
+    )
 
 
 def is_indoor(attraction: Attraction) -> bool:

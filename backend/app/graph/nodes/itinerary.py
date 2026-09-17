@@ -168,6 +168,7 @@ def _build_day_prompt(
     route_lines: list[str],
     feedback: list[str],
     stops_hi: int,
+    indoor_filtered: bool = False,
 ) -> str:
     candidate_lines = [
         f"- place_id={r.attraction.place_id} | {r.attraction.name} | "
@@ -183,8 +184,16 @@ def _build_day_prompt(
 
     weather_block = ""
     if forecast is not None:
-        bad_weather_hint = " (bad weather, prefer indoor stops)" if forecast.is_bad_weather else ""
-        weather_block = f"\nWeather: {forecast.condition}, {forecast.avg_temp_c:.0f}C{bad_weather_hint}\n"
+        if indoor_filtered:
+            # Already hard-filtered to indoor candidates below (see
+            # itinerary_node) -- no need to also ask the LLM to prefer them.
+            weather_block = (
+                f"\nWeather: {forecast.condition}, {forecast.avg_temp_c:.0f}C -- the traveller asked to skip "
+                "outdoor plans on bad-weather days, so only indoor candidates are listed below.\n"
+            )
+        else:
+            bad_weather_hint = " (bad weather, prefer indoor stops)" if forecast.is_bad_weather else ""
+            weather_block = f"\nWeather: {forecast.condition}, {forecast.avg_temp_c:.0f}C{bad_weather_hint}\n"
 
     feedback_block = ""
     if feedback:
@@ -220,14 +229,19 @@ together to travel between. The typical_visit per candidate is only a starting a
 dwell_minutes from what you know about the specific place (a world-class museum realistically
 needs 2-3 hours, a big zoo 2-3, a quick landmark 15-20 min), within its ok-range.
 {weather_block}
-Candidate attractions available today (already ranked by relevance, and already excludes anything
-used on another day of this trip -- pick only from this list). A candidate with an `hours` list is
-closed on any weekday marked "closed" -- don't pick it if today is one; a place open only a few
-hours that day is a poor pick if you want a long visit there:
+Candidate attractions available today, listed highest-ranked first (relevance to the traveller's
+stated interests blended with rating; already excludes anything used on another day of this trip --
+pick only from this list). Review count is a real popularity signal: a place with tens of thousands
+of reviews is a well-known highlight most visitors would regret skipping, while a similarly-rated
+place with a handful of reviews is a minor, easily-missable spot -- don't let a small travel-time
+saving talk you out of a major landmark in favor of an obscure one just because it happens to sit
+closer to your other picks. A candidate with an `hours` list is closed on any weekday marked
+"closed" -- don't pick it if today is one; a place open only a few hours that day is a poor pick if
+you want a long visit there:
 {chr(10).join(candidate_lines)}
 
-Driving time between the top candidates (prefer picking places close together so the day isn't
-spent in transit):
+Driving time between the top candidates (use this to sequence a good route among your picks, not to
+override picking the well-known highlights above):
 {chr(10).join(route_lines) or 'none available'}
 {feedback_block}
 
@@ -276,7 +290,13 @@ def itinerary_node(state: AgentState, *, llm=None) -> dict:
 
     if not ranked:
         errors = list(state.get("errors", []))
-        errors.append("itinerary: no ranked attractions available, produced an empty plan")
+        # attractions_node already explains an empty pool caused by a
+        # destination it couldn't resolve at all (see its "destination_not_found"
+        # tag) -- don't pile on a second, more generic error for the traveller
+        # to read past. Anything else that left the pool empty still gets this
+        # fallback so it isn't silently swallowed.
+        if "destination_not_found" not in errors:
+            errors.append("itinerary: no ranked attractions available, produced an empty plan")
         return {"itinerary": _empty_days(trip_setup, num_days), "refine_iterations": refine_iterations, "errors": errors}
 
     previous_days = state.get("itinerary") or []
@@ -338,8 +358,21 @@ def itinerary_node(state: AgentState, *, llm=None) -> dict:
             if violations_by_day.get(future) or future >= len(previous_days)
         )
         effective_hi = min(stops_hi, max(stops_lo, len(available) - future_regen_days * stops_lo))
+
+        forecast = forecasts.get(date)
+        day_available = available
+        indoor_filtered = False
+        if forecast is not None and forecast.is_bad_weather and trip_setup.get("avoid_outdoor_in_bad_weather"):
+            indoor_only = [r for r in available if is_indoor(r.attraction)]
+            # Only commit to the hard filter if it still leaves enough to
+            # fill the day -- otherwise fall back to the full pool (and the
+            # unfiltered weather hint) rather than handing back a thin day.
+            if len(indoor_only) >= stops_lo:
+                day_available = indoor_only
+                indoor_filtered = True
+
         prompt = _build_day_prompt(
-            trip_setup, date, available, forecasts.get(date), route_lines, day_feedback, effective_hi
+            trip_setup, date, day_available, forecast, route_lines, day_feedback, effective_hi, indoor_filtered
         )
 
         structured_llm = (llm or _default_llm()).with_structured_output(_LLMDayPlan)

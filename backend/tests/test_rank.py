@@ -121,3 +121,44 @@ def test_rank_attractions_respects_top_n(fake_embed):
     ranked = rank_attractions(candidates, "art and history", top_n=1)
 
     assert len(ranked) == 1
+
+
+def test_popularity_rank_favors_heavily_reviewed_landmark_over_similarly_rated_obscure_spot():
+    # Same star rating -- only review count should separate them.
+    landmark = _attraction("Big Ben", rating=4.6, rating_count=99_521)
+    obscure = _attraction("Historical Plaque", rating=4.6, rating_count=58)
+
+    ranked = rank_module.rank_attractions_by_popularity([landmark, obscure])
+
+    assert ranked[0].attraction.name == "Big Ben"
+    # The gap should be wide, not a narrow embedding-noise-sized margin --
+    # this is the whole point of using review count as its own signal.
+    assert ranked[0].score - ranked[1].score > 0.2
+
+
+def test_popularity_rank_still_lets_a_much_higher_rating_win():
+    slightly_less_reviewed_but_better_rated = _attraction("Tower Bridge", rating=4.8, rating_count=50_000)
+    heavily_reviewed_but_mediocre = _attraction("Tourist Trap", rating=3.5, rating_count=50_000)
+
+    ranked = rank_module.rank_attractions_by_popularity(
+        [slightly_less_reviewed_but_better_rated, heavily_reviewed_but_mediocre]
+    )
+
+    assert ranked[0].attraction.name == "Tower Bridge"
+
+
+def test_popularity_rank_caps_at_very_high_review_counts():
+    assert rank_module._popularity(_attraction("A", rating=4.5, rating_count=100_000)) == pytest.approx(1.0)
+    assert rank_module._popularity(_attraction("B", rating=4.5, rating_count=10_000_000)) == pytest.approx(1.0)
+
+
+def test_popularity_rank_empty_candidates_returns_empty():
+    assert rank_module.rank_attractions_by_popularity([]) == []
+
+
+def test_popularity_rank_respects_top_n():
+    candidates = [_attraction(f"Place {i}", rating=4.5, rating_count=i * 100) for i in range(5)]
+
+    ranked = rank_module.rank_attractions_by_popularity(candidates, top_n=2)
+
+    assert len(ranked) == 2

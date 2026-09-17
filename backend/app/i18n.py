@@ -80,18 +80,6 @@ def budget_options_limited(lang: Lang) -> str:
     )
 
 
-def stops_dropped_to_fit(lang: Lang, names: list[str]) -> str:
-    if lang == "zh":
-        return (
-            f"有些地点当天在营业时间和通勤时间内排不下，已移除：{'、'.join(names)}。"
-            "可以考虑延长每日游玩时间，或减少当天的景点数量。"
-        )
-    return (
-        f"Some stops couldn't be fitted into their day around opening hours and travel time "
-        f"and were left out: {', '.join(names)}. Consider a longer day or fewer stops."
-    )
-
-
 def refine_limit_reached(lang: Lang, attempts: int, violations: list[str]) -> str:
     if lang == "zh":
         return f"已达到重排上限（{attempts} 次尝试），仍有未解决的问题：{'；'.join(violations)}"
@@ -114,6 +102,10 @@ _ERROR_TAG_LABELS: dict[str, dict[Lang, str]] = {
     "weather": {"en": "Weather lookup failed", "zh": "天气查询失败"},
     "route": {"en": "Route lookup failed", "zh": "路线查询失败"},
     "itinerary": {"en": "Itinerary generation failed", "zh": "行程生成失败"},
+    "destination_not_found": {
+        "en": "Destination not found — check the spelling and try again.",
+        "zh": "找不到目的地，请检查拼写后重试。",
+    },
 }
 
 

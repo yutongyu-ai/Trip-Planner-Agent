@@ -1,5 +1,10 @@
 # Agent end-to-end evaluation
 
+Evaluates the *generation* pipeline (`POST /trip-plan`) — a fixed workflow.
+For the conversational edit agent's own evaluation (the one part of this
+project where the model chooses its own tool calls), see
+[`eval/agent_chat/`](../agent_chat/README.md) instead.
+
 An **ablation**: how much does each of the three pieces that make an
 itinerary *feasible* actually contribute?
 

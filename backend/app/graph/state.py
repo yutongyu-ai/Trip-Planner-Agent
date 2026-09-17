@@ -27,11 +27,22 @@ class TripSetup(TypedDict):
     start_date: dt.date
     end_date: dt.date
     interests: list[str]
+    # Free-text supplement to the fixed interest checkboxes -- folded into
+    # the semantic-ranking preference text (see attractions.py's
+    # _preference_text) but deliberately kept out of the Places search query
+    # itself (see places_client.py's _build_query), so a stray or oddly
+    # phrased note can't derail what actually gets recalled from Places.
+    preference_notes: str | None
     daily_pace: DailyPace
     budget_level: BudgetLevel
     day_start_time: dt.time
     day_end_time: dt.time
     lang: Lang
+    # Traveller preference, stated upfront rather than inferred: whether a
+    # day with a bad-weather forecast should hard-filter to indoor-only
+    # candidates (see itinerary.py's use of this). Some travellers don't
+    # mind rain; this can't be assumed either way.
+    avoid_outdoor_in_bad_weather: bool
 
 
 class ItineraryStop(TypedDict):
@@ -96,5 +107,15 @@ class AgentState(TypedDict, total=False):
     # days that actually need it on a refine pass.
     violations_by_day: dict[int, list[str]]
     refine_iterations: int
+    # True when the refine loop structurally can't fix a remaining violation
+    # (not enough affordable candidates / the candidate pool is already
+    # fully used) -- set by check_constraints_node, read by human_review_node
+    # to decide whether to pause and ask the traveller instead of looping.
+    budget_unavoidable: bool
+    pool_exhausted: bool
+    # Set by human_review_node once interrupt() resumes: "accept" (proceed
+    # to finalize as-is) or "relax_budget" (bumped trip_setup["budget_level"]
+    # up a tier and looped back for one more refine attempt).
+    human_decision: str
 
     errors: list[str]

@@ -5,3 +5,4 @@ langgraph>=0.2
 langchain-openai>=0.2
 sentence-transformers>=3.2
 numpy>=1.26
+mcp>=2.0  # app/mcp_server.py -- exposes the Places/Weather/Route tool clients over MCP

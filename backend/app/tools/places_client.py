@@ -31,6 +31,36 @@ _FIELD_MASK = ",".join(
 _RADIUS_LADDER_M = [10_000, 25_000, 50_000]
 MIN_CANDIDATES = 5
 
+# Text Search (New) pages at up to 20 results (`pageSize`) and caps at 60
+# total across all pages (per Google's docs, "subject to change") -- two
+# pages covers app.graph.nodes._shared.candidate_pool_target for all but the
+# longest/most packed trips; see that function's docstring for why going
+# further isn't worth chasing. Each extra page is a full extra round-trip
+# (this client's 10s httpx timeout applies per request, not per search), so
+# _search_text only fetches a second page when the first didn't already
+# reach `max_results`.
+_MAX_PAGES_PER_SEARCH = 2
+
+# Google Places `types` that mark a result as an actual geographic area
+# (city, town, region, country) rather than a business or landmark a bare-name
+# text search fuzzy-matched by coincidence -- observed for real: "effefev"
+# matched "EF International Language Campus" (types ["educational_institution",
+# "point_of_interest", "establishment"]) purely because Google's text search
+# always tries to return *something* close to the query text, never because
+# "effefev" is a place. _resolve_city_center only trusts a hit tagged with one
+# of these; anything else is treated the same as no match at all.
+_LOCALITY_TYPES = {
+    "country",
+    "administrative_area_level_1",
+    "administrative_area_level_2",
+    "administrative_area_level_3",
+    "locality",
+    "postal_town",
+    "sublocality",
+    "sublocality_level_1",
+    "neighborhood",
+}
+
 
 @dataclass(frozen=True)
 class Attraction:
@@ -72,6 +102,19 @@ class PlacesClient:
         self._api_key = api_key
         self._client = client or httpx.Client(timeout=10.0)
 
+    def city_exists(self, city: str, language_code: str = "en") -> bool:
+        """Cheap standalone check for whether `city` resolves to a real
+        geographic place at all -- the same bare-name lookup
+        search_attractions uses internally to anchor its search (see
+        _resolve_city_center), exposed on its own for a fast
+        destination-field validation endpoint that shouldn't have to run a
+        full attraction search just to answer "does this place exist".
+        Raises PlacesClientError on a genuine API failure, same as
+        search_attractions -- callers should treat that as inconclusive, not
+        as "doesn't exist".
+        """
+        return self._resolve_city_center(city, language_code) is not None
+
     def search_attractions(
         self, city: str, interests: list[str], max_results: int = 20, language_code: str = "en"
     ) -> list[Attraction]:
@@ -90,12 +133,25 @@ class PlacesClient:
         Google drop the "in <city>" location entirely and fall back to
         biasing results around this server's own IP location instead.
 
+        A `city` that doesn't resolve to anywhere real (`_resolve_city_center`
+        returns None) gets the same treatment up front, for the same reason:
+        without a locationBias, Google still returns *something* for the
+        "<interests> in <city>" query -- anchored to the server's own IP
+        location -- which for a nonexistent/misspelled city produces a fully
+        formed, plausible-looking itinerary for a completely wrong place
+        instead of an honest empty result. `_resolve_city_center` has
+        already been checked to resolve real city names reliably (see its
+        own docstring), so treating its failure as "no candidates" here is
+        safe rather than overeager.
+
         `language_code` (a BCP-47 code, e.g. "zh-CN") only changes what
         language Google returns display names/addresses/summaries in -- it
         doesn't affect which places match `query`.
         """
         query = self._build_query(city, interests)
         center = self._resolve_city_center(city, language_code)
+        if center is None:
+            return []
         last_results: list[Attraction] = []
         for radius_m in _RADIUS_LADDER_M:
             last_results = self._search_text(query, radius_m, max_results, language_code, center)
@@ -108,16 +164,25 @@ class PlacesClient:
         lookup -- unlike "<interests> in <city>", a query that's just the
         city name on its own reliably resolves to that city's own location
         (verified against several city/interest combinations that otherwise
-        misfired). Returns None if the city doesn't resolve to anything or
-        the lookup itself fails, so the caller can fall back to an
-        unconstrained search rather than failing the whole request over a
-        location-bias nicety.
+        misfired). Returns None when the lookup matches nothing, OR when the
+        top hit isn't actually tagged as a geographic area (see
+        _LOCALITY_TYPES) -- Google's text search always tries to return its
+        closest match rather than fail cleanly, so a nonsense city name can
+        still "resolve" to an unrelated business or landmark that happens to
+        fuzzy-match the text. Either way, search_attractions treats that as
+        "this city doesn't exist" (see its docstring). A genuine API failure
+        here is a different situation entirely (a transient/auth problem,
+        not a verdict on the destination), so it's deliberately left to
+        propagate as PlacesClientError rather than being folded into the
+        same None.
         """
-        try:
-            results = self._search_text(city, radius_m=None, max_results=1, language_code=language_code, center=None)
-        except PlacesClientError:
+        results = self._search_text(city, radius_m=None, max_results=1, language_code=language_code, center=None)
+        if not results:
             return None
-        return (results[0].lat, results[0].lng) if results else None
+        top = results[0]
+        if not (set(top.categories) & _LOCALITY_TYPES):
+            return None
+        return (top.lat, top.lng)
 
     def _build_query(self, city: str, interests: list[str]) -> str:
         # Deliberately no "attractions" in the interest-driven case: that
@@ -140,31 +205,46 @@ class PlacesClient:
         language_code: str,
         center: tuple[float, float] | None,
     ) -> list[Attraction]:
-        payload = {
-            "textQuery": query,
-            "maxResultCount": min(max_results, 20),
-            "languageCode": language_code,
-        }
-        if center is not None and radius_m is not None:
-            lat, lng = center
-            payload["locationBias"] = {
-                "circle": {"center": {"latitude": lat, "longitude": lng}, "radius": float(radius_m)}
+        """One radius attempt, paginated up to `max_results` or
+        _MAX_PAGES_PER_SEARCH pages, whichever comes first. Only requests a
+        second page when the first fell short of `max_results` and the
+        response actually offered a `nextPageToken` -- most searches (a
+        short trip, or a destination with few results at all) are satisfied
+        by page one alone."""
+        results: list[Attraction] = []
+        page_token: str | None = None
+        for _ in range(_MAX_PAGES_PER_SEARCH):
+            payload = {
+                "textQuery": query,
+                "pageSize": min(max_results, 20),
+                "languageCode": language_code,
             }
-        headers = {
-            "X-Goog-Api-Key": self._api_key,
-            "X-Goog-FieldMask": _FIELD_MASK,
-            "Content-Type": "application/json",
-        }
-        try:
-            response = self._client.post(
-                PLACES_SEARCH_URL, json=payload, headers=headers
-            )
-            response.raise_for_status()
-        except httpx.HTTPError as exc:
-            raise PlacesClientError(f"Places API request failed: {exc}") from exc
+            if center is not None and radius_m is not None:
+                lat, lng = center
+                payload["locationBias"] = {
+                    "circle": {"center": {"latitude": lat, "longitude": lng}, "radius": float(radius_m)}
+                }
+            if page_token is not None:
+                payload["pageToken"] = page_token
+            headers = {
+                "X-Goog-Api-Key": self._api_key,
+                "X-Goog-FieldMask": _FIELD_MASK,
+                "Content-Type": "application/json",
+            }
+            try:
+                response = self._client.post(
+                    PLACES_SEARCH_URL, json=payload, headers=headers
+                )
+                response.raise_for_status()
+            except httpx.HTTPError as exc:
+                raise PlacesClientError(f"Places API request failed: {exc}") from exc
 
-        data = response.json()
-        return [self._parse_place(place) for place in data.get("places", [])]
+            data = response.json()
+            results.extend(self._parse_place(place) for place in data.get("places", []))
+            page_token = data.get("nextPageToken")
+            if len(results) >= max_results or not page_token:
+                break
+        return results
 
     @staticmethod
     def _parse_place(place: dict) -> Attraction:

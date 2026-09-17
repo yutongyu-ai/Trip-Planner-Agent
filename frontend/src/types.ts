@@ -6,11 +6,13 @@ export interface TripSetupRequest {
   start_date: string // YYYY-MM-DD
   end_date: string // YYYY-MM-DD
   interests: string[]
+  preference_notes?: string
   daily_pace: DailyPace
   budget_level: BudgetLevel
   day_start_time: string // HH:MM
   day_end_time: string // HH:MM
   lang: 'en' | 'zh'
+  avoid_outdoor_in_bad_weather: boolean
 }
 
 export interface ItineraryStop {
@@ -31,18 +33,24 @@ export interface ItineraryDay {
   date: string
   stops: ItineraryStop[]
   weather_note: string | null
-  // Attractions that were picked for this day but didn't make it in --
-  // either they couldn't be fitted around opening hours and travel time, or
-  // the place turns out to be closed all day that weekday. Already
-  // localized copy lives in `notes`.
-  dropped_stops: string[]
 }
 
 export interface TripPlanResponse {
+  session_id: string
   itinerary: ItineraryDay[]
   summary: string
   // Advisory lines (partial forecast, low-coverage destination, unresolved
   // constraints). Already localized by the backend.
   notes: string[]
   errors: string[]
+  // Stable tag for an error the frontend should act on (e.g. route back to
+  // the setup form and point at a specific field) instead of just displaying
+  // -- see backend/app/main.py. null for every other error, which is only
+  // ever advisory alongside a real itinerary.
+  error_code: string | null
+}
+
+export interface ChatResponse {
+  reply: string
+  itinerary: ItineraryDay[]
 }

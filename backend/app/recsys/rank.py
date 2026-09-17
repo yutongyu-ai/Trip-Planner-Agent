@@ -9,9 +9,8 @@ see eval/offline_recsys/run_eval.py — rather than guessed here.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-
-import numpy as np
 
 from app.recsys.embed import embed_texts
 from app.tools.places_client import Attraction
@@ -95,6 +94,72 @@ def rank_attractions(
                 score=score,
                 similarity=float(similarity),
                 normalized_rating=normalized_rating,
+            )
+        )
+
+    ranked.sort(key=lambda r: r.score, reverse=True)
+    return ranked[:top_n] if top_n is not None else ranked
+
+
+# Review counts at/above this cap the popularity term at 1.0 in
+# rank_attractions_by_popularity -- log10(100_000 + 1) ~= 5. Past this many
+# reviews a place is already an unambiguous highlight; letting the term keep
+# growing would let a handful of mega-attractions swamp the rating half of
+# the score entirely.
+_POPULARITY_REVIEW_CAP = 100_000
+
+
+def _popularity(attraction: Attraction) -> float:
+    """How many people have actually reviewed this place, log-scaled to
+    [0, 1] and capped -- a real "is this a well-known highlight" signal,
+    distinct from _normalized_rating's use of the same count (there, review
+    count only gates how much to trust the *rating*; it never rewards a
+    place for being popular per se). log-scaled because review counts span
+    orders of magnitude: a landmark with 100,000 reviews and one with 10,000
+    are both clearly well-known, but 100 reviews vs. 10 is a much smaller
+    real-world gap than the raw numbers suggest.
+    """
+    count = attraction.rating_count or 0
+    return min(math.log10(count + 1) / math.log10(_POPULARITY_REVIEW_CAP + 1), 1.0)
+
+
+def rank_attractions_by_popularity(
+    candidates: list[Attraction], top_n: int | None = None
+) -> list[RankedAttraction]:
+    """Rank by rating and popularity alone, no semantic similarity at all.
+
+    For a traveller who stated no interests, rank_attractions's preference
+    text degrades to a generic "general sightseeing" phrase that embeds
+    almost identically against every candidate tagged tourist_attraction --
+    the similarity term becomes noise rather than signal, and (confirmed
+    against a real London search) that noise is enough to bump globally
+    famous, heavily-reviewed landmarks like Big Ben below an obscure
+    58-review historical plaque that happened to embed a little closer.
+
+    Rating alone doesn't fix this either: London's top candidates are almost
+    all rated within 4.5-4.8, a band far too narrow to reliably separate
+    "must-see landmark" from "minor spot" -- Big Ben and a 58-review plaque
+    can carry the *same* star rating. Review count is the signal that
+    actually captures "this is a well-known highlight", so it's used here as
+    its own scoring term (see _popularity) rather than only as a confidence
+    gate on the rating (see _normalized_rating). This is a separate ranking
+    path, not a low-alpha call into rank_attractions, precisely so the
+    interest-driven case's offline-tuned DEFAULT_ALPHA (see
+    eval/offline_recsys) is untouched by this.
+    """
+    if not candidates:
+        return []
+
+    raw_ratings = [r for c in candidates if (r := _raw_normalized_rating(c)) is not None]
+    prior_mean = sum(raw_ratings) / len(raw_ratings) if raw_ratings else DEFAULT_RATING_PRIOR
+
+    ranked = []
+    for attraction in candidates:
+        normalized_rating = _normalized_rating(attraction, prior_mean)
+        score = 0.5 * normalized_rating + 0.5 * _popularity(attraction)
+        ranked.append(
+            RankedAttraction(
+                attraction=attraction, score=score, similarity=0.0, normalized_rating=normalized_rating
             )
         )
 

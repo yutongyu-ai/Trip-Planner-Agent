@@ -28,7 +28,11 @@ def _place(place_id: str) -> dict:
         "rating": 4.5,
         "userRatingCount": 100,
         "priceLevel": "PRICE_LEVEL_INEXPENSIVE",
-        "types": ["museum"],
+        # Includes "locality" so this fixture, reused as the mocked response
+        # for every Places call including the bare-name city-center lookup,
+        # also satisfies PlacesClient._resolve_city_center's _LOCALITY_TYPES
+        # check -- these tests aren't exercising city resolution itself.
+        "types": ["museum", "locality"],
         "editorialSummary": {"text": "A fine museum."},
     }
 
@@ -116,6 +120,26 @@ def test_graph_happy_path_within_weather_horizon(monkeypatch):
     assert result["constraint_violations"] == []
     assert len(result["weather_forecast"]) == 1  # weather node ran
     assert result["itinerary"][0]["weather_note"] is not None
+
+
+@respx.mock
+def test_graph_destination_not_found_skips_the_refine_loop(monkeypatch):
+    # A destination Places can't resolve at all (see attractions_node) must
+    # not send the refine loop chasing a candidate pool that will never grow
+    # -- previously an empty candidate pool wasn't recognized as
+    # "exhausted", so check_constraints_node flagged every day as
+    # under-filled and the graph burned its full MAX_REFINE_ITERATIONS
+    # before giving up (see _shared.is_pool_exhausted).
+    monkeypatch.setattr(rank_module, "embed_texts", lambda texts: np.ones((len(texts), 2)))
+    respx.post(PLACES_SEARCH_URL).mock(return_value=httpx.Response(200, json={"places": []}))
+    start_date = dt.date.today() + dt.timedelta(days=2)
+
+    graph = build_graph()
+    result = graph.invoke({"trip_setup": _trip_setup(start_date)})
+
+    assert "destination_not_found" in result["errors"]
+    assert result["constraint_violations"] == []
+    assert result["refine_iterations"] == 0
     assert "Lisbon" in result["summary"]
 
 

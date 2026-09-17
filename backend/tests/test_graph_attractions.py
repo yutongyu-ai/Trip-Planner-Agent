@@ -1,3 +1,5 @@
+import datetime as dt
+
 import httpx
 import numpy as np
 import pytest
@@ -8,10 +10,14 @@ from app.graph.nodes.attractions import attractions_node
 from app.recsys import rank as rank_module
 from app.tools.places_client import PLACES_SEARCH_URL, PlacesClient
 
+_DAY = dt.date(2026, 9, 1)
+
 
 def _trip_setup(**overrides) -> dict:
     base = {
         "destination": "Lisbon",
+        "start_date": _DAY,
+        "end_date": _DAY,
         "interests": ["museums"],
         "daily_pace": "moderate",
         "budget_level": "moderate",
@@ -29,7 +35,13 @@ def _place(place_id: str, name: str, country: str | None = None) -> dict:
         "rating": 4.5,
         "userRatingCount": 100,
         "priceLevel": "PRICE_LEVEL_MODERATE",
-        "types": ["museum"],
+        # Includes "locality" so this same fixture, reused as the mocked
+        # response for every call these tests make, also satisfies the
+        # bare-name city-center lookup's _LOCALITY_TYPES check (see
+        # PlacesClient._resolve_city_center) -- these tests aren't
+        # exercising city resolution itself, just attractions_node's use of
+        # the results.
+        "types": ["museum", "locality"],
         "editorialSummary": {"text": "A fine museum."},
     }
     if country is not None:
@@ -99,3 +111,60 @@ def test_attractions_node_degrades_gracefully_on_places_error(fake_provider):
     assert result["ranked_attractions"] == []
     assert result["low_coverage_destination"] is False
     assert any("attractions:" in e for e in result["errors"])
+
+
+@respx.mock
+def test_attractions_node_flags_destination_not_found_when_city_matches_nothing(fake_provider):
+    respx.post(PLACES_SEARCH_URL).mock(return_value=httpx.Response(200, json={"places": []}))
+
+    result = attractions_node({"trip_setup": _trip_setup(destination="ndjed")})
+
+    assert result["candidate_attractions"] == []
+    assert result["ranked_attractions"] == []
+    assert "destination_not_found" in result["errors"]
+
+
+@respx.mock
+def test_attractions_node_uses_semantic_rank_when_interests_given(fake_embed, fake_provider, monkeypatch):
+    respx.post(PLACES_SEARCH_URL).mock(
+        return_value=httpx.Response(200, json={"places": [_place("p1", "City Museum")]})
+    )
+    calls = {"semantic": 0, "popularity": 0}
+    monkeypatch.setattr(
+        attractions_node_module,
+        "rank_attractions",
+        lambda *a, **k: calls.__setitem__("semantic", calls["semantic"] + 1) or rank_module.rank_attractions(*a, **k),
+    )
+    monkeypatch.setattr(
+        attractions_node_module,
+        "rank_attractions_by_popularity",
+        lambda *a, **k: calls.__setitem__("popularity", calls["popularity"] + 1)
+        or rank_module.rank_attractions_by_popularity(*a, **k),
+    )
+
+    attractions_node({"trip_setup": _trip_setup(interests=["museums"])})
+
+    assert calls == {"semantic": 1, "popularity": 0}
+
+
+@respx.mock
+def test_attractions_node_uses_popularity_rank_when_interests_empty(fake_provider, monkeypatch):
+    respx.post(PLACES_SEARCH_URL).mock(
+        return_value=httpx.Response(200, json={"places": [_place("p1", "City Museum")]})
+    )
+    calls = {"semantic": 0, "popularity": 0}
+    monkeypatch.setattr(
+        attractions_node_module,
+        "rank_attractions",
+        lambda *a, **k: calls.__setitem__("semantic", calls["semantic"] + 1) or rank_module.rank_attractions(*a, **k),
+    )
+    monkeypatch.setattr(
+        attractions_node_module,
+        "rank_attractions_by_popularity",
+        lambda *a, **k: calls.__setitem__("popularity", calls["popularity"] + 1)
+        or rank_module.rank_attractions_by_popularity(*a, **k),
+    )
+
+    attractions_node({"trip_setup": _trip_setup(interests=[])})
+
+    assert calls == {"semantic": 0, "popularity": 1}

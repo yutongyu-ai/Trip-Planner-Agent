@@ -20,7 +20,11 @@ def _place(place_id: str, name: str) -> dict:
         "rating": 4.5,
         "userRatingCount": 100,
         "priceLevel": "PRICE_LEVEL_MODERATE",
-        "types": ["museum", "tourist_attraction"],
+        # Includes "locality" (in addition to a realistic attraction type)
+        # so the same fixture can double as a bare-name city-center lookup
+        # response in tests that reuse one mock for every call -- see
+        # PlacesClient._resolve_city_center's _LOCALITY_TYPES check.
+        "types": ["museum", "tourist_attraction", "locality"],
         "editorialSummary": {"text": "A fine museum."},
     }
 
@@ -112,7 +116,11 @@ def test_search_query_omits_attractions_keyword_when_interests_given():
     # "attractions" biases Google's text search toward generic landmarks,
     # diluting a themed search (e.g. food) with off-topic tourist-trap
     # results -- see app/tools/places_client.py's _build_query docstring.
-    route = respx.post(PLACES_SEARCH_URL).mock(return_value=httpx.Response(200, json={"places": []}))
+    route = respx.post(PLACES_SEARCH_URL)
+    route.side_effect = [
+        httpx.Response(200, json={"places": [_place("anchor", "Wuhan")]}),  # city-center resolution
+        *([httpx.Response(200, json={"places": []})] * 3),  # one per radius-ladder rung
+    ]
     client = PlacesClient(api_key="test-key")
 
     client.search_attractions("Wuhan", ["food"])
@@ -123,7 +131,11 @@ def test_search_query_omits_attractions_keyword_when_interests_given():
 
 @respx.mock
 def test_search_query_falls_back_to_attractions_when_no_interests():
-    route = respx.post(PLACES_SEARCH_URL).mock(return_value=httpx.Response(200, json={"places": []}))
+    route = respx.post(PLACES_SEARCH_URL)
+    route.side_effect = [
+        httpx.Response(200, json={"places": [_place("anchor", "Lisbon")]}),  # city-center resolution
+        *([httpx.Response(200, json={"places": []})] * 3),  # one per radius-ladder rung
+    ]
     client = PlacesClient(api_key="test-key")
 
     client.search_attractions("Lisbon", [])
@@ -272,19 +284,112 @@ def test_search_attractions_resolves_city_center_and_biases_the_search():
 
 
 @respx.mock
-def test_search_attractions_falls_back_to_unbiased_search_when_city_lookup_fails():
-    # The city-center lookup returns no places at all (e.g. a garbled
-    # destination) -- the actual search should still go out, just without a
-    # locationBias, rather than failing the whole request over it.
+def test_search_attractions_returns_empty_when_city_lookup_matches_nothing():
+    # The city-center lookup succeeding but matching nothing at all (e.g. a
+    # garbled/nonexistent destination like "ndjed") must NOT fall through to
+    # an unbiased search: with no locationBias, Google still returns
+    # *something* for the "<interests> in <city>" query -- anchored to the
+    # calling server's own IP location (observed for real: a nonexistent
+    # city produced a fully-formed, plausible-looking Manchester itinerary)
+    # -- which is worse than an honest empty result.
     route = respx.post(PLACES_SEARCH_URL)
-    route.side_effect = [
-        httpx.Response(200, json={"places": []}),
-        httpx.Response(200, json={"places": [_place("p1", "Some Place")] * 5}),
-    ]
+    route.side_effect = [httpx.Response(200, json={"places": []})]
     client = PlacesClient(api_key="test-key")
 
     results = client.search_attractions("Nowhereville", [])
 
-    assert len(results) == 5
-    search_body = json.loads(route.calls[1].request.content)
-    assert "locationBias" not in search_body
+    assert results == []
+    assert route.call_count == 1  # never even attempts the unbiased search
+
+
+@respx.mock
+def test_search_attractions_returns_empty_when_lookup_fuzzy_matches_a_non_locality_place():
+    # Observed for real: the bare-name lookup for "effefev" didn't come back
+    # empty -- Google's text search fuzzy-matched it to an unrelated
+    # business, "EF International Language Campus" (types
+    # educational_institution/point_of_interest/establishment, no locality
+    # tag at all), and the graph then produced a fully-formed itinerary for
+    # that business's city. A hit with no _LOCALITY_TYPES tag must be
+    # treated the same as no match.
+    fuzzy_match = {
+        "id": "biz1",
+        "displayName": {"text": "EF International Language Campus"},
+        "formattedAddress": "26 Wilbraham Rd, Manchester, UK",
+        "location": {"latitude": 53.44, "longitude": -2.23},
+        "types": ["educational_institution", "point_of_interest", "establishment"],
+    }
+    route = respx.post(PLACES_SEARCH_URL)
+    route.side_effect = [httpx.Response(200, json={"places": [fuzzy_match]})]
+    client = PlacesClient(api_key="test-key")
+
+    results = client.search_attractions("effefev", [])
+
+    assert results == []
+    assert route.call_count == 1  # never even attempts the unbiased search
+
+
+@respx.mock
+def test_search_attractions_fetches_a_second_page_when_the_first_falls_short():
+    route = respx.post(PLACES_SEARCH_URL)
+    page1 = [_place(f"p{i}", f"Place {i}") for i in range(20)]
+    page2 = [_place(f"q{i}", f"Extra {i}") for i in range(5)]
+    route.side_effect = [
+        httpx.Response(200, json={"places": [_place("anchor", "London")]}),  # city-center resolution
+        httpx.Response(200, json={"places": page1, "nextPageToken": "tok-1"}),
+        httpx.Response(200, json={"places": page2}),  # no nextPageToken -- last page
+    ]
+    client = PlacesClient(api_key="test-key")
+
+    results = client.search_attractions("London", ["museums"], max_results=25)
+
+    assert len(results) == 25
+    assert route.call_count == 3
+    second_page_body = json.loads(route.calls[2].request.content)
+    assert second_page_body["pageToken"] == "tok-1"
+
+
+@respx.mock
+def test_search_attractions_skips_the_second_page_once_max_results_is_met():
+    route = respx.post(PLACES_SEARCH_URL)
+    page1 = [_place(f"p{i}", f"Place {i}") for i in range(20)]
+    route.side_effect = [
+        httpx.Response(200, json={"places": [_place("anchor", "London")]}),  # city-center resolution
+        httpx.Response(200, json={"places": page1, "nextPageToken": "tok-1"}),
+    ]
+    client = PlacesClient(api_key="test-key")
+
+    results = client.search_attractions("London", ["museums"], max_results=20)
+
+    assert len(results) == 20
+    assert route.call_count == 2  # never spends a request on a page it doesn't need
+
+
+@respx.mock
+def test_search_attractions_stops_after_two_pages_even_with_more_available():
+    route = respx.post(PLACES_SEARCH_URL)
+    page1 = [_place(f"p{i}", f"Place {i}") for i in range(20)]
+    page2 = [_place(f"q{i}", f"Extra {i}") for i in range(20)]
+    route.side_effect = [
+        httpx.Response(200, json={"places": [_place("anchor", "London")]}),  # city-center resolution
+        httpx.Response(200, json={"places": page1, "nextPageToken": "tok-1"}),
+        httpx.Response(200, json={"places": page2, "nextPageToken": "tok-2"}),  # a third page exists...
+    ]
+    client = PlacesClient(api_key="test-key")
+
+    results = client.search_attractions("London", ["museums"], max_results=60)
+
+    assert len(results) == 40  # ...but _MAX_PAGES_PER_SEARCH caps it at two
+    assert route.call_count == 3
+
+
+@respx.mock
+def test_search_attractions_raises_when_city_lookup_itself_fails():
+    # A real API failure during the city-center lookup (bad key, quota,
+    # network) is a different situation from "this city doesn't exist" --
+    # it must propagate as PlacesClientError, not be silently folded into an
+    # empty "destination not found" result.
+    respx.post(PLACES_SEARCH_URL).mock(return_value=httpx.Response(403))
+    client = PlacesClient(api_key="bad-key")
+
+    with pytest.raises(PlacesClientError):
+        client.search_attractions("Nowhereville", [])

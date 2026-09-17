@@ -59,21 +59,6 @@ def test_finalize_reports_unresolved_violations():
     assert "too packed" in joined
 
 
-def test_finalize_notes_stops_the_scheduler_dropped():
-    state = {
-        "trip_setup": {"destination": "London"},
-        "itinerary": [
-            {"date": DAY, "stops": [{"place_id": "p1"}], "weather_note": None, "dropped_stops": ["London Zoo"]},
-        ],
-    }
-
-    result = finalize_node(state)
-
-    joined = " ".join(result["notes"])
-    assert "London Zoo" in joined
-    assert "couldn't be fitted" in joined
-
-
 def test_finalize_summarizes_stop_count_in_chinese():
     state = {
         "trip_setup": {"destination": "Wuhan", "lang": "zh"},
