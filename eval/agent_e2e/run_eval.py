@@ -16,7 +16,14 @@ Weather / Route are mocked via respx from `scenarios.SCENARIOS` so every run
 is reproducible; the OpenAI call inside itinerary_node is real
 (gpt-4o-mini, temperature=0), so this needs a real OPENAI_API_KEY in the
 repo-root .env and makes a modest number of paid API calls (one per
-scenario per variant).
+scenario per variant, times one per refine pass).
+
+`_RecordingLLM` (below) is the same monkeypatch point `hallucinated_place_id_rate`
+already used to see the LLM's raw output -- it now also reads each call's
+`usage_metadata` and times it, so `cost_usd_per_run` / `e2e_latency_s` /
+`llm_call_latency_s` come for free from calls this script makes anyway (no
+extra API calls), and the ablation's refine-loop cost shows up directly: a
+variant whose `refine_iterations` is higher pays for it in both of these.
 
 Run: python eval/agent_e2e/run_eval.py
 """
@@ -24,9 +31,11 @@ Run: python eval/agent_e2e/run_eval.py
 from __future__ import annotations
 
 import datetime as dt
+import json
 import math
 import sys
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from unittest import mock
 
@@ -200,6 +209,31 @@ def hallucinated_place_id_rate(raw_day_plans: list[_LLMDayPlan], valid_ids: set[
     return hallucinated / total if total else 0.0
 
 
+# gpt-4o-mini published pricing (USD per 1M tokens) -- an estimate from the
+# public rate card, not an actual billing figure.
+_INPUT_PRICE_PER_1M_TOKENS = 0.15
+_OUTPUT_PRICE_PER_1M_TOKENS = 0.60
+
+
+def llm_call_cost_usd(usage_records: list[dict]) -> float:
+    """Estimated dollar cost of every itinerary-LLM call made during one run
+    (one call per day per refine pass -- so this already reflects how many
+    extra calls a variant's refine loop triggered)."""
+    total = 0.0
+    for record in usage_records:
+        usage = record.get("usage") or {}
+        total += usage.get("input_tokens", 0) / 1_000_000 * _INPUT_PRICE_PER_1M_TOKENS
+        total += usage.get("output_tokens", 0) / 1_000_000 * _OUTPUT_PRICE_PER_1M_TOKENS
+    return total
+
+
+def mean_llm_call_latency_s(usage_records: list[dict]) -> float | None:
+    """Mean wall-clock time of a single itinerary-LLM call within this run.
+    None if the run made no LLM calls (shouldn't happen in practice)."""
+    values = [r["elapsed_s"] for r in usage_records]
+    return float(np.mean(values)) if values else None
+
+
 def bad_weather_indoor_rate(
     itinerary: list[dict],
     forecasts_by_date: dict[dt.date, DailyForecast],
@@ -227,23 +261,36 @@ def bad_weather_indoor_rate(
 
 
 class _RecordingStructuredLLM:
-    def __init__(self, structured, records: list[_LLMDayPlan]):
+    """Wraps the `include_raw=True` structured-output runnable so we can read
+    the raw AIMessage's `usage_metadata` and time the call, then hands
+    itinerary_node back exactly the bare `_LLMDayPlan` it already expects --
+    itinerary.py's own code is unaware this wrapper exists."""
+
+    def __init__(self, structured, plan_records: list[_LLMDayPlan], usage_records: list[dict]):
         self._structured = structured
-        self._records = records
+        self._plan_records = plan_records
+        self._usage_records = usage_records
 
     def invoke(self, prompt: str) -> _LLMDayPlan:
+        t0 = time.perf_counter()
         result = self._structured.invoke(prompt)
-        self._records.append(result)
-        return result
+        elapsed_s = time.perf_counter() - t0
+        parsed: _LLMDayPlan = result["parsed"]
+        usage = getattr(result["raw"], "usage_metadata", None)
+        self._usage_records.append({"elapsed_s": elapsed_s, "usage": usage})
+        self._plan_records.append(parsed)
+        return parsed
 
 
 class _RecordingLLM:
-    def __init__(self, real_llm, records: list[_LLMDayPlan]):
+    def __init__(self, real_llm, plan_records: list[_LLMDayPlan], usage_records: list[dict]):
         self._real_llm = real_llm
-        self._records = records
+        self._plan_records = plan_records
+        self._usage_records = usage_records
 
     def with_structured_output(self, schema):
-        return _RecordingStructuredLLM(self._real_llm.with_structured_output(schema), self._records)
+        structured = self._real_llm.with_structured_output(schema, include_raw=True)
+        return _RecordingStructuredLLM(structured, self._plan_records, self._usage_records)
 
 
 def _make_real_llm() -> ChatOpenAI:
@@ -307,10 +354,35 @@ def _table_response(request: httpx.Request) -> httpx.Response:
     return httpx.Response(200, json={"code": "Ok", "durations": durations, "distances": distances})
 
 
+def _places_search_handler(scenario: Scenario):
+    """`search_attractions` first makes a bare-city-name request to resolve
+    a location anchor (`PlacesClient._resolve_city_center`), which only
+    accepts a result tagged as a geographic area (see its `_LOCALITY_TYPES`
+    check) -- a flat mock that always returns the scenario's attractions
+    (museums, parks, ...) makes that lookup fail every time and the whole
+    search short-circuits to "destination_not_found" before the itinerary
+    LLM is ever called. Branch on the request's `textQuery` so the
+    city-name lookup gets a locality-tagged stand-in and the real
+    interest-based search (at any radius) still gets the scenario's places."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        if payload.get("textQuery") == scenario.destination:
+            city_center = {
+                "id": "scenario-city-center",
+                "displayName": {"text": scenario.destination},
+                "formattedAddress": scenario.destination,
+                "location": {"latitude": 0.0, "longitude": 0.0},
+                "types": ["locality"],
+            }
+            return httpx.Response(200, json={"places": [city_center]})
+        return httpx.Response(200, json={"places": [_place_json(p) for p in scenario.places]})
+
+    return handler
+
+
 def _mock_apis(scenario: Scenario) -> None:
-    respx.post(PLACES_SEARCH_URL).mock(
-        return_value=httpx.Response(200, json={"places": [_place_json(p) for p in scenario.places]})
-    )
+    respx.post(PLACES_SEARCH_URL).mock(side_effect=_places_search_handler(scenario))
 
     start_date = scenario.trip_setup()["start_date"]
     forecast_entries = []
@@ -338,11 +410,14 @@ def _fake_embeddings(texts: list[str]) -> np.ndarray:
 class RunOutcome:
     final_state: dict
     raw_llm_day_plans: list[_LLMDayPlan]
+    llm_usage: list[dict] = field(default_factory=list)
+    e2e_elapsed_s: float = 0.0
 
 
 def _run(graph, scenario: Scenario, variant: Variant) -> RunOutcome:
-    records: list[_LLMDayPlan] = []
-    recording_llm = _RecordingLLM(_make_real_llm(), records)
+    plan_records: list[_LLMDayPlan] = []
+    usage_records: list[dict] = []
+    recording_llm = _RecordingLLM(_make_real_llm(), plan_records, usage_records)
 
     patches = [
         mock.patch.object(itinerary_module, "_default_llm", lambda: recording_llm),
@@ -360,12 +435,16 @@ def _run(graph, scenario: Scenario, variant: Variant) -> RunOutcome:
         for patch in patches:
             patch.start()
         try:
+            t0 = time.perf_counter()
             final_state = graph.invoke({"trip_setup": scenario.trip_setup()})
+            e2e_elapsed_s = time.perf_counter() - t0
         finally:
             for patch in reversed(patches):
                 patch.stop()
 
-    return RunOutcome(final_state=final_state, raw_llm_day_plans=records)
+    return RunOutcome(
+        final_state=final_state, raw_llm_day_plans=plan_records, llm_usage=usage_records, e2e_elapsed_s=e2e_elapsed_s
+    )
 
 
 def _forecasts_by_date(state: dict) -> dict[dt.date, DailyForecast]:
@@ -381,6 +460,9 @@ def evaluate(variant: Variant, scenarios: list[Scenario]) -> tuple[dict[str, flo
         "avg_travel_min_per_day": [],
         "dropped_stop_rate": [],
         "hallucinated_place_id_rate": [],
+        "cost_usd_per_run": [],
+        "e2e_latency_s": [],
+        "llm_call_latency_s": [],
     }
     bad_weather_indoor_rates: list[float] = []
     rows: list[dict] = []
@@ -401,6 +483,11 @@ def evaluate(variant: Variant, scenarios: list[Scenario]) -> tuple[dict[str, flo
             metrics["avg_travel_min_per_day"].append(travel)
         metrics["dropped_stop_rate"].append(dropped_stop_rate(itinerary))
         metrics["hallucinated_place_id_rate"].append(hallucinated_place_id_rate(outcome.raw_llm_day_plans, valid_ids))
+        metrics["cost_usd_per_run"].append(llm_call_cost_usd(outcome.llm_usage))
+        metrics["e2e_latency_s"].append(outcome.e2e_elapsed_s)
+        call_latency = mean_llm_call_latency_s(outcome.llm_usage)
+        if call_latency is not None:
+            metrics["llm_call_latency_s"].append(call_latency)
 
         indoor_rate = bad_weather_indoor_rate(itinerary, _forecasts_by_date(state), attractions_by_id)
         if indoor_rate is not None:
@@ -441,12 +528,17 @@ def main() -> None:
     for variant in VARIANTS:
         aggregated[variant.name], per_scenario[variant.name] = evaluate(variant, SCENARIOS)
 
+    # cost is sub-cent per run with gpt-4o-mini -- needs more decimal places
+    # than the 0-1 rate metrics to not print as a misleading 0.000.
+    _HIGH_PRECISION_METRICS = {"cost_usd_per_run"}
+
     metric_names = list(next(iter(aggregated.values())).keys())
     header = f"{'metric':<30}" + "".join(f"{v.name:<22}" for v in VARIANTS)
     print(header)
     print("-" * len(header))
     for name in metric_names:
-        row = f"{name:<30}" + "".join(f"{aggregated[v.name][name]:<22.3f}" for v in VARIANTS)
+        precision = 6 if name in _HIGH_PRECISION_METRICS else 3
+        row = f"{name:<30}" + "".join(f"{aggregated[v.name][name]:<22.{precision}f}" for v in VARIANTS)
         print(row)
 
     print("\nper-scenario constraint satisfaction (Y = 0 violations):")

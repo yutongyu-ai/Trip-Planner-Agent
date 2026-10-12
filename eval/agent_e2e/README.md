@@ -6,7 +6,9 @@ project where the model chooses its own tool calls), see
 [`eval/agent_chat/`](../agent_chat/README.md) instead.
 
 An **ablation**: how much does each of the three pieces that make an
-itinerary *feasible* actually contribute?
+itinerary *feasible* actually contribute — to correctness, and (via
+`cost_usd_per_run` / `e2e_latency_s`) to what each extra LLM call the refine
+loop triggers actually costs in money and time?
 
 | # | variant | refine loop | deterministic scheduler | real OSRM matrix |
 |---|---|---|---|---|
@@ -29,7 +31,9 @@ is that component's marginal value.
 Places / Weather / Route are mocked via `respx` from `scenarios.SCENARIOS`,
 so runs are reproducible. The `gpt-4o-mini` call inside `itinerary_node` is
 **real** (temperature 0) — needs `OPENAI_API_KEY` in the repo-root `.env`;
-one call per scenario per variant.
+one call per day per scenario per variant, times one more per refine pass
+(so v2's `refine_iterations ≈ 0.95` roughly doubles its call count over
+v1/v3/v4 — see `cost_usd_per_run` in Results).
 
 ```
 python eval/agent_e2e/run_eval.py
@@ -72,12 +76,22 @@ choice:
 | `dropped_stop_rate` | share of picked stops the scheduler couldn't fit | lower¹ |
 | `hallucinated_place_id_rate` | LLM place_ids not in the candidate list | lower |
 | `bad_weather_indoor_rate` | indoor share of stops on rainy days | higher |
+| `cost_usd_per_run` | estimated gpt-4o-mini $ cost of every itinerary-LLM call a run made (one per day, times one per refine pass) | lower |
+| `e2e_latency_s` | wall-clock time for one full `/trip-plan` run (all days, all refine passes) | lower |
+| `llm_call_latency_s` | mean wall-clock time of a single itinerary-LLM call within a run | lower |
 
 ¹ 0.0 by construction when the scheduler is off (it never drops).
 
+`cost_usd_per_run` / `e2e_latency_s` / `llm_call_latency_s` come from the
+same `_RecordingLLM` monkeypatch that already captures the LLM's raw output
+for `hallucinated_place_id_rate` -- reading `usage_metadata` off calls the
+script was already making, not any extra API traffic. `cost_usd_per_run` is
+an estimate from gpt-4o-mini's published per-token rate card, not an actual
+bill.
+
 ## Results
 
-19 scenarios, `gpt-4o-mini` @ temp 0 (run 2026-09-11, single run against the
+19 scenarios, `gpt-4o-mini` @ temp 0 (run 2026-10-08, single run against the
 current scheduler — v1/v2 don't touch the scheduler at all, so expect their
 numbers to vary somewhat run to run with the model's picks; these are 19
 hand-built scenarios, not a representative sample, and 1.00 means "every
@@ -85,36 +99,61 @@ constructed failure mode is covered", not "any real trip will pass"):
 
 | metric | v1 `llm-times` | v2 `+refine` | v3 `+scheduler` | v4 `+matrix` |
 |---|---|---|---|---|
-| **constraint_satisfaction_rate** | 0.53 | 0.68 | **1.00** | **1.00** |
-| refine_iterations (mean) | 0.00 | 0.84 | **0.00** | 0.00 |
-| avg_travel_min_per_day | –¹ | –¹ | ~10 | ~10 |
+| **constraint_satisfaction_rate** | 0.42 | 0.63 | **1.00** | **1.00** |
+| refine_iterations (mean) | 0.00 | 0.95 | **0.00** | 0.00 |
+| avg_travel_min_per_day | 15.8¹ | 13.7¹ | 10.3 | 11.3 |
 | empty_day_rate | 0.02 | 0.02 | 0.02 | 0.02 |
-| hallucinated_place_id_rate | 0.02 | 0.02 | 0.02 | 0.02 |
+| hallucinated_place_id_rate | 0.02 | 0.01 | 0.02 | 0.02 |
+| cost_usd_per_run | $0.00029 | $0.00054 | $0.00029 | $0.00030 |
+| e2e_latency_s | 5.8 | 6.9 | 4.6 | 5.6 |
+| llm_call_latency_s | 2.6 | 1.7 | 1.6 | 1.7 |
 
 ¹ v1/v2 keep the LLM's pick order unchanged, so their travel figure isn't a
 controlled comparison.
 
 **Reading it:**
 
-- **v1 (0.53): 9 of 19 scenarios fail** with the LLM assigning its own
-  times and no retry. **v2 (+refine, 0.68): 6 still fail** —
-  `packed_late_opening_landmarks`, `packed_spread_out_city`,
-  `moderate_two_neighborhoods`, `relaxed_early_closing_highlight`,
-  `moderate_everything_opens_at_ten`, `packed_museum_quarter_plus_outliers`.
-  Re-prompting the LLM fixes some cases (3 of the 9) but not these six,
-  because they're arithmetic problems (an opening-hours-forced order, travel
-  between neighbourhoods), not phrasing ones.
+- **v1 (0.42): 11 of 19 scenarios fail** with the LLM assigning its own
+  times and no retry. **v2 (+refine, 0.63): 7 still fail** —
+  `relaxed_moderate_6day_partial_forecast`, `packed_late_opening_landmarks`,
+  `packed_spread_out_city`, `packed_opening_hours_gauntlet`,
+  `moderate_two_neighborhoods`, `moderate_everything_opens_at_ten`,
+  `packed_museum_quarter_plus_outliers`. Re-prompting the LLM fixes some
+  cases but not these seven, because they're arithmetic problems (an
+  opening-hours-forced order, travel between neighbourhoods), not phrasing
+  ones. (The exact failing set shifts a little run to run with the model's
+  picks — an earlier run's list substitutes
+  `relaxed_early_closing_highlight` for `relaxed_moderate_6day_partial_forecast`
+  and `packed_opening_hours_gauntlet`; the v1→v2 story, "re-prompting alone
+  fixes some but a hard core of arithmetic failures remains," is stable even
+  when the exact names aren't.)
 - **v2 → v3 (+scheduler): → 1.00, zero remaining violations across all 19
   scenarios** — including `relaxed_budget_barely_feasible`, a "budget
   traveller, expensive city" case that has flaked in earlier runs.
   `refine_iterations` at v3 is **0.00** — once timing, allocation and meal
   breaks are all deterministic, the refine loop is never triggered.
-- **v3 → v4 (+matrix): no measurable difference here.** The matrix's real
-  value is routing around obstacles a straight line misses (a river with
-  few bridges, a motorway), but the eval mocks OSRM's `table` service with
-  a haversine calculation, so v3 and v4 are computing nearly the same thing.
-  In production the matrix feeds the ordering search real road times; the
-  synthetic eval can't quantify that.
+- **v3 → v4 (+matrix): no measurable difference in feasibility.** The
+  matrix's real value is routing around obstacles a straight line misses (a
+  river with few bridges, a motorway), but the eval mocks OSRM's `table`
+  service with a haversine calculation, so v3 and v4 are computing nearly
+  the same thing. In production the matrix feeds the ordering search real
+  road times; the synthetic eval can't quantify that.
+- **The refine loop's correctness gain in v2 isn't free, and now that's
+  measured instead of just implied by `refine_iterations`.** v2 triggers a
+  second `itinerary_node` pass on 95% of scenarios (`refine_iterations =
+  0.95`), and that shows up directly as both the highest `cost_usd_per_run`
+  ($0.00054, ~86% above v1/v3) and the slowest `e2e_latency_s` (6.9s) of all
+  four variants. v3 then gets to **both** `constraint_satisfaction_rate =
+  1.00` **and** the lowest cost and latency of the four — cheaper and faster
+  than v1, not just more correct — because a deterministic scheduler that
+  gets the day right on the first pass needs no extra LLM calls to fix it.
+  This is the clearest evidence in the whole ablation that "trust Python for
+  arithmetic" wasn't a correctness/cost trade-off: it improved both at once.
+  (`llm_call_latency_s`, the cost of one single call, doesn't follow the
+  same clean pattern across variants — that column is dominated by
+  run-to-run OpenAI response-time variance, not anything the ablation flags
+  control; the structural, repeatable effect is on *how many* calls a run
+  makes, which `refine_iterations` and `cost_usd_per_run` already capture.)
 
 Travel times are door-to-door estimates (`realistic_transit_minutes`):
 raw free-flow driving, scaled ~1.6× for congestion, plus a fixed ~8-minute
@@ -128,7 +167,7 @@ never dropped over one bad gap, and the route itself is never split into
 independent halves that could separate two attractions that happen to sit
 right next to each other.
 
-Building this eval caught four problems unit tests couldn't:
+Building this eval caught five problems unit tests couldn't:
 
 1. `ends_too_early` — a check that flagged any day finishing well before a
    "fill the window to X%" target. It fought the tight scheduler on nearly
@@ -146,5 +185,20 @@ Building this eval caught four problems unit tests couldn't:
    (a "budget" traveller in a city with only expensive attractions). Now
    `check_constraints` only hard-fails budget when there *were* enough
    affordable options; otherwise `finalize` adds an advisory note.
+5. Adding `cost_usd_per_run` / `e2e_latency_s` surfaced a stale mock: a
+   later commit gave `PlacesClient.search_attractions` a bare-city-name
+   lookup (`_resolve_city_center`) that only accepts a result tagged as a
+   geographic area, but `_mock_apis` answered every Places request with the
+   same flat list of attractions (museums, parks, ...) regardless of query
+   -- so that lookup always failed and every scenario silently resolved to
+   `destination_not_found` with an empty itinerary, zero LLM calls, and
+   (vacuously) zero constraint violations. Every existing metric tolerated
+   this (`hallucinated_place_id_rate` and friends are defined as 0.0 for no
+   stops), so it went unnoticed; `llm_call_latency_s` was the first metric
+   that cared whether the LLM was ever actually called, and returning `None`
+   (→ `nan` once aggregated) for "no calls happened" is what caught it.
+   Fixed in `_places_search_handler`: the mock now branches on the request's
+   `textQuery`, returning a locality-tagged stand-in for the bare-city-name
+   query and the scenario's real attractions for the interest-based one.
 
 The numbers above are post-fix.

@@ -6,6 +6,7 @@ docstring.
 
 import datetime as dt
 import re
+from types import SimpleNamespace
 
 import run_eval  # noqa: E402  (adds backend/ to sys.path as an import side effect)
 
@@ -102,6 +103,31 @@ def test_hallucinated_place_id_rate_is_zero_with_no_stops():
     assert run_eval.hallucinated_place_id_rate([], valid_ids={"p1"}) == 0.0
 
 
+def test_llm_call_cost_usd_sums_input_and_output_at_gpt4o_mini_rates():
+    usage_records = [
+        {"elapsed_s": 1.0, "usage": {"input_tokens": 1_000_000, "output_tokens": 0}},
+        {"elapsed_s": 1.0, "usage": {"input_tokens": 0, "output_tokens": 1_000_000}},
+    ]
+    assert run_eval.llm_call_cost_usd(usage_records) == 0.15 + 0.60
+
+
+def test_llm_call_cost_usd_is_zero_for_no_calls():
+    assert run_eval.llm_call_cost_usd([]) == 0.0
+
+
+def test_llm_call_cost_usd_tolerates_missing_usage():
+    assert run_eval.llm_call_cost_usd([{"elapsed_s": 1.0, "usage": None}]) == 0.0
+
+
+def test_mean_llm_call_latency_s_averages_elapsed_times():
+    usage_records = [{"elapsed_s": 1.0, "usage": {}}, {"elapsed_s": 3.0, "usage": {}}]
+    assert run_eval.mean_llm_call_latency_s(usage_records) == 2.0
+
+
+def test_mean_llm_call_latency_s_is_none_for_no_calls():
+    assert run_eval.mean_llm_call_latency_s([]) is None
+
+
 def test_bad_weather_indoor_rate_ignores_days_without_bad_weather():
     date = dt.date(2026, 1, 1)
     itinerary = [_day(date, ["outdoor1"])]
@@ -127,16 +153,21 @@ def test_bad_weather_indoor_rate_measures_indoor_share_on_bad_weather_days():
 
 class _ScriptedStructuredLLM:
     """Picks the first few `place_id=` values it sees in the prompt, so the
-    harness smoke test doesn't need a real model."""
+    harness smoke test doesn't need a real model. Mirrors the
+    `include_raw=True` shape (`{"raw": ..., "parsed": ...}`) _RecordingLLM
+    now always requests, with a zeroed-out usage_metadata standing in for a
+    real token count."""
 
-    def invoke(self, prompt: str) -> _LLMDayPlan:
+    def invoke(self, prompt: str) -> dict:
         ids = re.findall(r"place_id=(\S+)", prompt)
         hi = int(re.search(r"Return \d+-(\d+) stops", prompt).group(1))
-        return _LLMDayPlan(stops=[_LLMStop(place_id=pid, dwell_minutes=120) for pid in ids[:hi]])
+        parsed = _LLMDayPlan(stops=[_LLMStop(place_id=pid, dwell_minutes=120) for pid in ids[:hi]])
+        raw = SimpleNamespace(usage_metadata={"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+        return {"raw": raw, "parsed": parsed, "parsing_error": None}
 
 
 class _ScriptedLLM:
-    def with_structured_output(self, schema):
+    def with_structured_output(self, schema, include_raw: bool = False):
         return _ScriptedStructuredLLM()
 
 
@@ -148,6 +179,11 @@ def test_every_variant_runs_end_to_end(monkeypatch):
         aggregated, rows = run_eval.evaluate(variant, [scenario])
         assert 0.0 <= aggregated["constraint_satisfaction_rate"] <= 1.0
         assert len(rows) == 1
+        # scripted LLM reports zero usage, so cost is 0 but must still be a
+        # real number (not nan) -- proves the usage/timing plumbing ran.
+        assert aggregated["cost_usd_per_run"] == 0.0
+        assert aggregated["e2e_latency_s"] >= 0.0
+        assert aggregated["llm_call_latency_s"] >= 0.0
 
     # With the scheduler on, the late-opening landmarks scenario should be
     # feasible; with it off (LLM assigns 09:00 to an 11:00 attraction) it
