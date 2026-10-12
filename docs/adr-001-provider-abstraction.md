@@ -47,11 +47,6 @@ Hong Kong, Macau and Taiwan are fine).
 
 - The China migration (ADR-002) is now a matter of adding three provider
   classes and a branch in the factory, not touching the graph.
-- The factory functions are also what `app/mcp_server.py` calls directly to
-  expose the same three tools over MCP — a concrete second beneficiary of
-  this seam being real code rather than a promise: wrapping them as MCP
-  tools needed no changes here, only a declarative `@mcp.tool()` layer on
-  top.
 - `finalize_node` can emit an honest "this destination is poorly covered"
   advisory (surfaced through the new `notes` field) instead of silently
   returning a low-quality itinerary.

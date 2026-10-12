@@ -125,7 +125,7 @@ doc; the Amap/QWeather code stays deferred. Part 4 optional, not started.
 
 ## Part 4 — Adjacent polish (optional, low priority)
 
-- Normalize code comments to English: `backend/requirements-agent.txt`,
+- Normalize code comments to English: `backend/requirements.txt`,
   `.env.example` currently carry Chinese comments. User-facing i18n stays
   bilingual. (Done.)
 - Deploy live and add a URL to the README.
@@ -216,7 +216,7 @@ stays deferred):
 - `docs/adr-001-provider-abstraction.md`, `docs/adr-002-china-provider.md` —
   new.
 - `README.md` scope section + `README.zh.md` — new.
-- `.env.example`, `backend/requirements-agent.txt` — comments → English.
+- `.env.example`, `backend/requirements.txt` — comments → English.
 - Tests updated: `test_places_client`, `test_graph_attractions`,
   `test_graph_weather`, `test_graph_route`, `test_graph_finalize`,
   `test_graph`, `test_main`.
