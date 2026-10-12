@@ -3,9 +3,19 @@
 call and when to stop, rather than following a fixed pipeline. See
 scenarios.py for why each scenario needs more than one tool call to satisfy.
 
+Three metrics, each answering a different question invalid_tool_call_rate
+alone can't: task_success (did the final state reflect the request),
+tool_selection_accuracy (did it call the tools this task needed, in order,
+and avoid the ones it had no reason to reach for -- see `disallowed_tools`
+on clear_weather_no_swap_needed and direct_remove_no_search_needed),
+invalid_tool_call_rate (were the calls it did make well-formed against the
+real session state). trajectory_length is reported per scenario for context
+only -- it has no universal "better" direction (the right call count is
+task-specific), so it isn't trended as a metric.
+
 Makes real gpt-4o-mini calls (temperature 0); needs a real OPENAI_API_KEY in
 the repo-root .env. Weather is monkeypatched to a scripted forecast so the
-weather-triggered scenario is reproducible without a live API call.
+weather-triggered scenarios are reproducible without a live API call.
 
 Run: python eval/agent_chat/run_eval.py
 """
@@ -62,10 +72,20 @@ def _run(scenario: ChatScenario) -> RunOutcome:
         p.start()
     try:
         agent = build_chat_agent(state, MemorySaver())
-        result = agent.invoke(
-            {"messages": [("user", scenario.user_message)]},
-            config={"configurable": {"thread_id": scenario.name}, "recursion_limit": MAX_AGENT_STEPS},
-        )
+        # Multi-turn scenarios (user_messages set) invoke the same thread_id
+        # repeatedly, exactly as separate /chat requests for one session
+        # would -- the checkpointer carries conversation history and `state`
+        # itself carries prior turns' mutations forward. Only the final
+        # turn's result is kept: with a checkpointer, each invoke returns
+        # the full accumulated message history for the thread, not just
+        # that turn's own messages.
+        turns = scenario.user_messages if scenario.user_messages is not None else [scenario.user_message]
+        result = None
+        for turn in turns:
+            result = agent.invoke(
+                {"messages": [("user", turn)]},
+                config={"configurable": {"thread_id": scenario.name}, "recursion_limit": MAX_AGENT_STEPS},
+            )
     finally:
         for p in patches:
             p.stop()
@@ -89,8 +109,23 @@ def invalid_tool_call_rate(outcome: RunOutcome) -> float:
     return invalid / len(outcome.tool_calls)
 
 
-def reached_required_marker(outcome: RunOutcome, marker: str) -> bool:
-    return any(marker in content for _, content in outcome.tool_calls)
+def is_subsequence(required: list[str], actual: list[str]) -> bool:
+    """Whether `required` appears in `actual`, in order, allowing extra
+    items in between (e.g. an extra list_itinerary check doesn't break it)."""
+    it = iter(actual)
+    return all(tool in it for tool in required)
+
+
+def tool_selection_accuracy(outcome: RunOutcome, scenario: ChatScenario) -> bool:
+    """Did the model call the tools this task actually needed (in the right
+    relative order) and avoid the ones it had no reason to call? Orthogonal
+    to invalid_tool_call_rate: every call here can be individually
+    well-formed and still add up to the wrong plan (e.g. skipping
+    check_weather and guessing) -- see eval/agent_chat/README.md."""
+    called = [name for name, _ in outcome.tool_calls]
+    required_ok = is_subsequence(scenario.expected_tool_sequence, called)
+    no_violation = not any(t in called for t in scenario.disallowed_tools)
+    return required_ok and no_violation
 
 
 def task_success(outcome: RunOutcome, scenario: ChatScenario) -> bool:
@@ -113,23 +148,22 @@ def main() -> None:
         rows.append(
             {
                 "scenario": scenario.name,
-                "trajectory_length": trajectory_length(outcome),
-                "met_min_calls": trajectory_length(outcome) >= scenario.min_expected_tool_calls,
-                "reached_marker": reached_required_marker(outcome, scenario.required_trajectory_marker),
+                "trajectory_length": trajectory_length(outcome),  # context only -- see module docstring
                 "invalid_tool_call_rate": invalid_tool_call_rate(outcome),
+                "tool_selection_accuracy": tool_selection_accuracy(outcome, scenario),
                 "task_success": task_success(outcome, scenario),
                 "tool_calls": [name for name, _ in outcome.tool_calls],
                 "final_reply": outcome.final_reply,
             }
         )
 
-    header = f"{'scenario':<38}{'traj_len':<10}{'>=min':<8}{'marker':<8}{'invalid%':<10}{'success':<8}"
+    header = f"{'scenario':<38}{'steps':<8}{'invalid%':<10}{'tool_sel':<10}{'success':<8}"
     print(header)
     print("-" * len(header))
     for row in rows:
         print(
-            f"{row['scenario']:<38}{row['trajectory_length']:<10}{str(row['met_min_calls']):<8}"
-            f"{str(row['reached_marker']):<8}{row['invalid_tool_call_rate']:<10.2f}{str(row['task_success']):<8}"
+            f"{row['scenario']:<38}{row['trajectory_length']:<8}{row['invalid_tool_call_rate']:<10.2f}"
+            f"{str(row['tool_selection_accuracy']):<10}{str(row['task_success']):<8}"
         )
 
     print("\ntool-call sequence per scenario:")
@@ -139,8 +173,8 @@ def main() -> None:
 
     n = len(rows)
     print("\naggregate:")
-    print(f"  mean trajectory_length: {sum(r['trajectory_length'] for r in rows) / n:.2f}")
     print(f"  task_success_rate: {sum(r['task_success'] for r in rows) / n:.2f}")
+    print(f"  tool_selection_accuracy_rate: {sum(r['tool_selection_accuracy'] for r in rows) / n:.2f}")
     print(f"  mean invalid_tool_call_rate: {sum(r['invalid_tool_call_rate'] for r in rows) / n:.2f}")
 
 

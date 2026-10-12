@@ -11,8 +11,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "backend"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from run_eval import RunOutcome, invalid_tool_call_rate, reached_required_marker, task_success, trajectory_length  # noqa: E402
-from scenarios import SCENARIOS  # noqa: E402
+from run_eval import (  # noqa: E402
+    RunOutcome,
+    invalid_tool_call_rate,
+    is_subsequence,
+    task_success,
+    tool_selection_accuracy,
+    trajectory_length,
+)
+from scenarios import SCENARIOS, ChatScenario  # noqa: E402
 
 
 def _outcome(tool_calls: list[tuple[str, str]], final_state: dict | None = None) -> RunOutcome:
@@ -38,10 +45,44 @@ def test_invalid_tool_call_rate_is_zero_for_no_calls():
     assert invalid_tool_call_rate(_outcome([])) == 0.0
 
 
-def test_reached_required_marker():
-    outcome = _outcome([("find_alternative", "place_id=museum-cheap | ...")])
-    assert reached_required_marker(outcome, "museum-cheap") is True
-    assert reached_required_marker(outcome, "museum-lux") is False
+def test_is_subsequence_allows_extra_calls_in_between():
+    assert is_subsequence(["check_weather", "swap_stop"], ["check_weather", "list_itinerary", "swap_stop"]) is True
+
+
+def test_is_subsequence_fails_on_wrong_order():
+    assert is_subsequence(["check_weather", "swap_stop"], ["swap_stop", "check_weather"]) is False
+
+
+def test_is_subsequence_fails_when_a_required_tool_is_missing():
+    assert is_subsequence(["check_weather", "swap_stop"], ["check_weather"]) is False
+
+
+def test_is_subsequence_is_trivially_true_for_no_requirement():
+    assert is_subsequence([], ["anything"]) is True
+
+
+def test_tool_selection_accuracy_fails_when_disallowed_tool_is_called():
+    scenario = ChatScenario(
+        name="t",
+        state={},
+        user_message="",
+        expected_tool_sequence=["check_weather"],
+        disallowed_tools=["swap_stop"],
+    )
+    outcome = _outcome([("check_weather", "..."), ("swap_stop", "...")])
+    assert tool_selection_accuracy(outcome, scenario) is False
+
+
+def test_tool_selection_accuracy_passes_when_required_met_and_nothing_disallowed_called():
+    scenario = ChatScenario(
+        name="t",
+        state={},
+        user_message="",
+        expected_tool_sequence=["check_weather"],
+        disallowed_tools=["swap_stop"],
+    )
+    outcome = _outcome([("check_weather", "...")])
+    assert tool_selection_accuracy(outcome, scenario) is True
 
 
 def test_task_success_checks_removed_and_present_place_ids():
